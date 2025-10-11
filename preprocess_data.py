@@ -10,14 +10,12 @@ import pandas as pd
 import geopandas
 from shapely.geometry import Polygon, box
 import rasterio
-from rasterio.windows import from_bounds
+from rasterio.windows import from_bounds, Window
 from pyproj import Transformer, CRS
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from utils import set_seed
-import config
 
-# --- Configuration ---
+# We will use local config variables as per the rolled-back version
 BASE_DATA_DIR = Path("data")
 PREPROCESSED_DATA_DIR = Path("preprocessed_data")
 VISUALIZATION_DIR = PREPROCESSED_DATA_DIR / "visualizations"
@@ -30,86 +28,46 @@ PATCH_HEIGHT_PIXELS = 256
 NUM_VISUALIZATIONS_PER_SPLIT = 10
 
 def get_vegetation_columns(df: pd.DataFrame) -> list:
-    """
-    Identifies the correct vegetation column names from the dataframe.
-    This is now safer and explicitly excludes non-vegetation columns.
-    """
+    """Identifies the correct vegetation column names from the dataframe."""
     try:
-        # The vegetation data is assumed to start at the 'Ste' column.
         start_index = df.columns.to_list().index('Ste')
-        
-        # Define columns that appear after 'Ste' but are not vegetation percentages.
-        # CRITICAL: Also exclude the 'geometry' column that GeoPandas uses.
         excluded_cols = {'Dens_veg', 'Mat_Pos', 'Comments', 'Kontroll%', 'geometry'}
-        
         potential_cols = df.columns[start_index:].to_list()
-        
-        # Filter the list to get only the valid vegetation columns.
-        veg_cols = [
-            col for col in potential_cols 
-            if col not in excluded_cols and 'Unnamed' not in str(col)
-        ]
-        return veg_cols
+        return [c for c in potential_cols if c not in excluded_cols and 'Unnamed' not in str(c)]
     except ValueError:
-        # This error occurs if the 'Ste' column is not found in the dataframe.
         return []
 
-
 def load_all_annotations(all_xlsx_paths: list) -> geopandas.GeoDataFrame:
-    """
-    Scans all XLSX files, intelligently finds the header row, loads all valid annotations,
-    and returns a single master GeoDataFrame.
-    """
+    """Scans all XLSX files, intelligently finds the header row, and loads all valid annotations."""
     all_dfs = []
     for xlsx_path in tqdm(all_xlsx_paths, desc="Loading all annotations"):
         try:
             df = pd.read_excel(xlsx_path, engine='openpyxl')
-            
             if 'Latitud' not in df.columns or 'Longitud' not in df.columns:
                 found_header = False
                 df_no_header = pd.read_excel(xlsx_path, engine='openpyxl', header=None, nrows=20)
                 for i, row in df_no_header.iterrows():
                     if 'Latitud' in row.values and 'Longitud' in row.values:
                         df = pd.read_excel(xlsx_path, engine='openpyxl', header=i)
-                        found_header = True
-                        break
-                if not found_header:
-                    continue
-
-            if 'Latitud' not in df.columns or 'Longitud' not in df.columns:
-                 continue
-
+                        found_header = True; break
+                if not found_header: continue
+            if 'Latitud' not in df.columns or 'Longitud' not in df.columns: continue
             df.dropna(subset=['Latitud', 'Longitud'], inplace=True)
             df = df[pd.to_numeric(df['Latitud'], errors='coerce').notna()]
             df = df[pd.to_numeric(df['Longitud'], errors='coerce').notna()]
-            
-            if not df.empty:
-                all_dfs.append(df)
-
+            if not df.empty: all_dfs.append(df)
         except Exception as e:
-            print(f"\nWarning: Could not process file {xlsx_path.name}. Reason: {e}")
-            continue
-    
-    if not all_dfs:
-        return geopandas.GeoDataFrame()
-
+            print(f"\nWarning: Could not process file {xlsx_path.name}. Reason: {e}"); continue
+    if not all_dfs: return geopandas.GeoDataFrame()
     master_df = pd.concat(all_dfs, ignore_index=True)
     if 'geometry' in master_df.columns:
         master_df = master_df.drop(columns=['geometry'])
-
-    master_gdf = geopandas.GeoDataFrame(
-        master_df, 
-        geometry=geopandas.points_from_xy(master_df.Longitud, master_df.Latitud),
-        crs=WGS84_CRS
-    )
-    return master_gdf
-
+    return geopandas.GeoDataFrame(master_df, geometry=geopandas.points_from_xy(master_df.Longitud, master_df.Latitud), crs=WGS84_CRS)
 
 def load_roi_polygon_wgs84(data_dir: Path) -> Polygon:
     """Loads ROI points from roi.txt and returns a Polygon in WGS84 CRS."""
     roi_filepath = data_dir / ROI_FILE_NAME
-    if not roi_filepath.exists():
-        raise FileNotFoundError(f"{ROI_FILE_NAME} not found in {data_dir}. Cannot proceed.")
+    if not roi_filepath.exists(): raise FileNotFoundError(f"{ROI_FILE_NAME} not found.")
     points_wgs84 = pd.read_csv(roi_filepath, header=None, names=['lat', 'lon'])
     return Polygon(zip(points_wgs84.lon, points_wgs84.lat))
 
@@ -129,115 +87,107 @@ def get_roi_overlapping_geotiffs(geotiff_paths: list, roi_poly_wgs84: Polygon) -
     return overlapping_files
 
 def process_geotiff_and_annotations(tif_path: Path, master_annotations_gdf: geopandas.GeoDataFrame, roi_polygon_wgs84: Polygon, output_dir: Path, generated_patches: list):
-    """Processes a GeoTIFF by spatially querying the master annotation database."""
+    """Processes a GeoTIFF by generating patches with 7x7 target squares."""
     try:
         with rasterio.open(tif_path) as src:
             image_crs = src.crs
-            image_bounds_poly = box(*src.bounds)
-            
             annotations_in_img_crs = master_annotations_gdf.to_crs(image_crs)
-            annotations_in_image = annotations_in_img_crs[annotations_in_img_crs.geometry.intersects(image_bounds_poly)].copy()
-
-            if annotations_in_image.empty:
-                return
+            annotations_in_image = annotations_in_img_crs[annotations_in_img_crs.geometry.intersects(box(*src.bounds))].copy()
+            if annotations_in_image.empty: return
 
             transformer = Transformer.from_crs(WGS84_CRS, image_crs, always_xy=True)
             roi_poly_image_crs = Polygon([transformer.transform(x, y) for x, y in roi_polygon_wgs84.exterior.coords])
             annotations_in_roi = annotations_in_image[annotations_in_image.geometry.within(roi_poly_image_crs)].copy()
-
-            if annotations_in_roi.empty:
-                return
+            if annotations_in_roi.empty: return
 
             veg_cols = get_vegetation_columns(annotations_in_roi)
-            if not veg_cols:
-                return
-            
+            if not veg_cols: return
             annotations_in_roi[veg_cols] = annotations_in_roi[veg_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
-            
+
             print(f"  -> SUCCESS: Found {len(annotations_in_roi)} valid annotations for {tif_path.name}. Generating patches...")
-            
-            patch_count = 0
-            for _, annotation in annotations_in_roi.iterrows():
-                patch_count += 1
-                
-                px, py = annotation.geometry.x, annotation.geometry.y
-                pixel_width_m, pixel_height_m = src.transform.a, -src.transform.e
-                patch_width_m, patch_height_m = PATCH_WIDTH_PIXELS*pixel_width_m, PATCH_HEIGHT_PIXELS*pixel_height_m
 
-                offset_x, offset_y = random.uniform(-patch_width_m/2, patch_width_m/2), random.uniform(-patch_height_m/2, patch_height_m/2)
-                center_x, center_y = px - offset_x, py - offset_y
-                minx, maxx, miny, maxy = center_x-patch_width_m/2, center_x+patch_width_m/2, center_y-patch_height_m/2, center_y+patch_height_m/2
-                
+            total_patches_generated = 0
+            discarded_patches = 0
+
+            for ann_idx, annotation in annotations_in_roi.iterrows():
                 try:
-                    patch_window = from_bounds(minx, miny, maxx, maxy, src.transform)
-                    source_patch = src.read(window=patch_window)
-                    _, actual_height, actual_width = source_patch.shape
-                    if actual_height != PATCH_HEIGHT_PIXELS or actual_width != PATCH_WIDTH_PIXELS:
-                        padded_patch = np.zeros((src.count, PATCH_HEIGHT_PIXELS, PATCH_WIDTH_PIXELS), dtype=source_patch.dtype)
-                        padded_patch[:, :actual_height, :actual_width] = source_patch
-                        source_patch = padded_patch
-                except Exception: continue
+                    true_row, true_col = src.index(annotation.geometry.x, annotation.geometry.y)
+                except rasterio.errors.OutOfBoundTransformError:
+                    continue
 
-                patch_bounds_poly = box(minx, miny, maxx, maxy)
-                annotations_in_patch = annotations_in_roi[annotations_in_roi.geometry.within(patch_bounds_poly)]
+                h, w = PATCH_HEIGHT_PIXELS, PATCH_WIDTH_PIXELS
+                patch_row_in_img = random.randint(0, h - 1)
+                patch_col_in_img = random.randint(0, w - 1)
+
+                top = true_row - patch_row_in_img
+                left = true_col - patch_col_in_img
+
+                if top < 0 or left < 0 or (top + h) > src.height or (left + w) > src.width:
+                    discarded_patches += 1
+                    continue
+
+                patch_window = Window(left, top, w, h)
+                source_patch = src.read(window=patch_window)
+
+                if source_patch.shape[1] != h or source_patch.shape[2] != w: continue
+                if source_patch.shape[0] > 3: source_patch = source_patch[:3, :, :]
+                if np.max(source_patch) == 0 or (np.issubdtype(source_patch.dtype, np.integer) and np.min(source_patch) == np.iinfo(source_patch.dtype).max):
+                    discarded_patches += 1
+                    continue
+
+                patch_bounds_geo = src.window_bounds(patch_window)
+                patch_poly = box(*patch_bounds_geo)
+                annotations_in_patch = annotations_in_roi[annotations_in_roi.geometry.intersects(patch_poly)]
                 if annotations_in_patch.empty: continue
 
-                target_binary = np.zeros((PATCH_HEIGHT_PIXELS, PATCH_WIDTH_PIXELS), dtype=np.uint8)
+                target_binary = np.zeros((h, w), dtype=np.uint8)
                 mask_binary = np.zeros_like(target_binary)
 
+                # --- MODIFIED: Create 7x7 target squares ---
                 for _, ann_in_patch in annotations_in_patch.iterrows():
-                    col = int((ann_in_patch.geometry.x - minx) / pixel_width_m)
-                    row = int((maxy - ann_in_patch.geometry.y) / pixel_height_m)
-                    if not (0 <= row < PATCH_HEIGHT_PIXELS and 0 <= col < PATCH_WIDTH_PIXELS): continue
+                    try:
+                        abs_row, abs_col = src.index(ann_in_patch.geometry.x, ann_in_patch.geometry.y)
+                        rel_row, rel_col = abs_row - top, abs_col - left
+                        if not (0 <= rel_row < h and 0 <= rel_col < w): continue
 
-                    if ann_in_patch[veg_cols].sum() >= 40:
-                        target_binary[row, col] = 1
-                    mask_binary[row, col] = 1
-                
-                base_name = f"{tif_path.stem}_patch_{patch_count:04d}"
+                        # Define the 7x7 square boundaries
+                        square_size = 7
+                        offset = square_size // 2 # This is 3 for a 7x7 square
+
+                        r_min = max(0, rel_row - offset)
+                        r_max = min(h, rel_row + offset + 1)
+                        c_min = max(0, rel_col - offset)
+                        c_max = min(w, rel_col + offset + 1)
+
+                        # Fill the square in the mask for all annotations
+                        mask_binary[r_min:r_max, c_min:c_max] = 1
+
+                        # Fill the square in the target only if it meets the vegetation criteria
+                        if ann_in_patch[veg_cols].sum() >= 40:
+                            target_binary[r_min:r_max, c_min:c_max] = 1
+
+                    except Exception: continue
+
+                total_patches_generated += 1
+                base_name = f"{tif_path.stem}_patch_{total_patches_generated:04d}"
                 output_dir.mkdir(parents=True, exist_ok=True)
                 with h5py.File(output_dir / f"{base_name}_source.h5", "w") as hf: hf.create_dataset("image", data=source_patch)
                 with h5py.File(output_dir / f"{base_name}_target_binary.h5", "w") as hf: hf.create_dataset("target", data=target_binary)
                 with h5py.File(output_dir / f"{base_name}_mask_binary.h5", "w") as hf: hf.create_dataset("mask", data=mask_binary)
-
                 generated_patches.append({'base_name': base_name, 'output_dir': output_dir})
+
+            print(f"  - Successfully generated {total_patches_generated} patches.")
+            if discarded_patches > 0:
+                print(f"  - Discarded {discarded_patches} invalid patch attempts (out of bounds or solid color).")
 
     except Exception as e:
         print(f"FATAL: Failed to process GeoTIFF {tif_path.name}. Error: {e}")
-
-def create_visualization(patch_info: dict, vis_dir: Path):
-    """Creates and saves a visualization for a single data patch."""
-    base_name, data_dir = patch_info['base_name'], patch_info['output_dir']
-    try:
-        with h5py.File(data_dir / f"{base_name}_source.h5", 'r') as hf: source_img = hf['image'][:]
-        with h5py.File(data_dir / f"{base_name}_target_binary.h5", 'r') as hf: target_bin = hf['target'][:]
-        with h5py.File(data_dir / f"{base_name}_mask_binary.h5", 'r') as hf: mask_bin = hf['mask'][:]
-
-        rgb_img = source_img[:3, :, :].astype(np.float32)
-        for i in range(rgb_img.shape[0]):
-            min_val, max_val = np.min(rgb_img[i]), np.max(rgb_img[i])
-            if max_val > min_val: rgb_img[i] = (rgb_img[i] - min_val) / (max_val - min_val)
-        rgb_img = np.transpose(rgb_img, (1, 2, 0))
-
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        axes[0].imshow(rgb_img); axes[0].set_title("Source RGB"); axes[0].axis('off')
-        axes[1].imshow(target_bin, cmap='gray'); axes[1].set_title("Binary Target"); axes[1].axis('off')
-        axes[2].imshow(mask_bin, cmap='magma'); axes[2].set_title("Annotation Mask"); axes[2].axis('off')
-        
-        plt.tight_layout()
-        vis_dir.mkdir(parents=True, exist_ok=True)
-        plt.savefig(vis_dir / f"{base_name}.png", dpi=150)
-        plt.close(fig)
-    except Exception as e:
-        print(f"    - Could not create visualization for {base_name}. Error: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess GeoTIFFs by finding overlapping annotations from all XLSX files.")
     parser.add_argument("--data_dir", type=str, default=str(BASE_DATA_DIR), help="Path to the root data directory.")
     parser.add_argument("--output_dir", type=str, default=str(PREPROCESSED_DATA_DIR), help="Path to the output directory.")
     args = parser.parse_args()
-
-    set_seed(config.GLOBAL_RANDOM_SEED)
 
     data_dir, output_dir = Path(args.data_dir), Path(args.output_dir)
     print("--- Starting Preprocessing ---")
@@ -249,30 +199,18 @@ def main():
         print("CRITICAL: No valid annotations found in any XLSX files. Exiting."); return
     print(f"\nLoaded a total of {len(master_annotations_gdf)} annotations from all files.")
 
-    # --- NEW: Label Distribution Printout ---
     veg_cols = get_vegetation_columns(master_annotations_gdf)
-    if not veg_cols:
-        print("\nWarning: Could not determine vegetation columns. Skipping label distribution printout.")
-    else:
-        # Create a temporary copy for calculations to avoid modifying the original
+    if veg_cols:
         temp_df = master_annotations_gdf.copy()
-        # Ensure vegetation columns are numeric for calculation
         temp_df[veg_cols] = temp_df[veg_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
-        
-        # Calculate total vegetation and the binary label for each point
         total_vegetation = temp_df[veg_cols].sum(axis=1)
         binary_labels = (total_vegetation >= 40).astype(int)
-        
-        # Get the value counts
         label_counts = binary_labels.value_counts()
-        
-        # Print the formatted summary
         print("\n--- Raw Annotation Label Distribution ---")
         print(f"Total annotations loaded: {len(master_annotations_gdf)}")
         print(f"  - Class 0 (Non-Vegetation, < 40%): {label_counts.get(0, 0)}")
         print(f"  - Class 1 (Vegetation, >= 40%):    {label_counts.get(1, 0)}")
         print("-----------------------------------------\n")
-    # --- END NEW ---
 
     all_geotiff_paths = list(data_dir.glob("**/*.tif"))
     if not all_geotiff_paths: print("No GeoTIFF files found. Exiting."); return
@@ -306,27 +244,13 @@ def main():
         if not tif_files: continue
         print(f"--- Processing {split.upper()} Set ---")
         split_output_dir = output_dir / split
-        
+
         for tif_path in tif_files:
             process_geotiff_and_annotations(tif_path, master_annotations_gdf, roi_poly_wgs84, split_output_dir, generated_patches[split])
 
-    print("\n--- Creating Visualizations ---")
-    for split, patches in generated_patches.items():
-        if not patches:
-            print(f"No patches generated for '{split}' set, skipping visualization.")
-            continue
-        
-        num_samples = min(NUM_VISUALIZATIONS_PER_SPLIT, len(patches))
-        print(f"Generating {num_samples} visualizations for '{split}' set...")
-        
-        samples_to_visualize = random.sample(patches, num_samples)
-        split_vis_dir = VISUALIZATION_DIR / split
-        
-        for patch_info in tqdm(samples_to_visualize, desc=f"Visualizing {split} samples"):
-            create_visualization(patch_info, split_vis_dir)
-        print(f"Visualizations for '{split}' set saved to {split_vis_dir}")
-
+    # Visualization is removed as it's handled by the training script.
     print("\n--- Preprocessing Complete ---")
 
 if __name__ == "__main__":
     main()
+

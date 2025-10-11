@@ -9,29 +9,28 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
+from torchvision import transforms
 import numpy as np
 
 # Import from our config and utils files
 import config
-from utils import create_inference_visualization, set_seed
+from utils import create_inference_visualization, set_seed, save_loss_plot
 
-# --- Dataset Class ---
+# --- Dataset Class with Advanced Augmentations ---
 class PreprocessedBinaryVegDataset(Dataset):
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, photometric_augs=None, geometric_augs=None):
         self.data_dir = data_dir
+        self.photometric_augs = photometric_augs
+        self.geometric_augs = geometric_augs
         self.patch_basenames: List[str] = []
         if not self.data_dir.exists():
-            print(f"Warning: Data directory not found: {self.data_dir}")
-            return
-
+            print(f"Warning: Data directory not found: {self.data_dir}"); return
         for h5_file in self.data_dir.glob("*_source.h5"):
             self.patch_basenames.append(h5_file.name.replace("_source.h5", ""))
-        
         if not self.patch_basenames:
             print(f"Warning: No patches found in {self.data_dir}")
         else:
-             print(f"  Dataset for {data_dir.name}: Found {len(self.patch_basenames)} samples.")
-            
+            print(f"  Dataset for {data_dir.name}: Found {len(self.patch_basenames)} samples.")
         self.num_input_channels: Optional[int] = None
         if self.patch_basenames:
             with h5py.File(self.data_dir / f"{self.patch_basenames[0]}_source.h5", "r") as hf:
@@ -44,20 +43,30 @@ class PreprocessedBinaryVegDataset(Dataset):
         basename = self.patch_basenames[idx]
         try:
             with h5py.File(self.data_dir / f"{basename}_source.h5", "r") as hf:
-                inputs_np = hf["image"][:].astype(np.float32)
+                image = torch.from_numpy(hf["image"][:].astype(np.float32))
             with h5py.File(self.data_dir / f"{basename}_target_binary.h5", "r") as hf:
-                targets_np = hf["target"][:].astype(np.float32)
+                target = torch.from_numpy(hf["target"][:].astype(np.float32)).unsqueeze(0)
             with h5py.File(self.data_dir / f"{basename}_mask_binary.h5", "r") as hf:
-                mask_np = hf["mask"][:].astype(np.float32)
+                mask = torch.from_numpy(hf["mask"][:].astype(np.float32)).unsqueeze(0)
 
-            return {
-                'image': torch.from_numpy(inputs_np),
-                'target': torch.from_numpy(targets_np).unsqueeze(0),
-                'mask': torch.from_numpy(mask_np).unsqueeze(0)
-            }
+            # --- SIMPLIFIED AUGMENTATION LOGIC ---
+            
+            # 1. Apply photometric augmentations directly to the 3-channel image.
+            if self.photometric_augs:
+                image = self.photometric_augs(image)
+
+            # 2. Apply geometric augmentations to everything consistently.
+            if self.geometric_augs:
+                # Stack image and masks to apply transforms together
+                stacked = torch.cat((image, target, mask), dim=0)
+                augmented = self.geometric_augs(stacked)
+                # Un-stack them back into separate tensors
+                image, target, mask = torch.split(augmented, [self.num_input_channels, 1, 1], dim=0)
+
+            return {'image': image, 'target': target, 'mask': mask}
         except Exception as e:
             print(f"Error loading HDF5 file for basename {basename}: {e}"); raise
-# --- U-Net Model (Standard Implementation) ---
+
 
 class DoubleConv(nn.Module):
     """(convolution => [BN] => ReLU) * 2"""
@@ -217,6 +226,8 @@ def train_model(model, train_dataset, val_dataset, test_dataset, criterion, opti
     print(f"--- Starting training on {device} ---")
     best_val_loss = float('inf')
 
+    train_losses, val_losses = [], []
+
     for epoch in range(num_epochs):
         # --- Training Step ---
         model.train()
@@ -246,6 +257,11 @@ def train_model(model, train_dataset, val_dataset, test_dataset, criterion, opti
                 val_loss += loss.item()
         
         avg_val_loss = val_loss / len(val_loader)
+        
+        # --- NEW: Log losses ---
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
+        
         print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
         # Save the best model
@@ -253,15 +269,16 @@ def train_model(model, train_dataset, val_dataset, test_dataset, criterion, opti
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), config.CHECKPOINT_DIR / "best_model_binary.pth")
             print(f"  -> New best model saved with val loss: {best_val_loss:.4f}")
+        
+        # --- NEW: Generate and save loss plot after each epoch ---
+        save_loss_plot(train_losses, val_losses, config.VISUALIZATION_DIR / "loss_curve.png")
             
-        # --- Per-Epoch Visualization Step ---
         print(f"--- Generating visualizations for Epoch {epoch+1} ---")
         
         # Pass the current epoch number (epoch + 1) to the visualization function.
         # The output directory is now the base visualization directory.
         create_inference_visualization(model, train_dataset, device, config.VISUALIZATION_DIR, epoch=epoch + 1, num_samples=10, split_name='train')
         create_inference_visualization(model, val_dataset, device, config.VISUALIZATION_DIR, epoch=epoch + 1, num_samples=10, split_name='val')
-        create_inference_visualization(model, test_dataset, device, config.VISUALIZATION_DIR, epoch=epoch + 1, num_samples=10, split_name='test')
 
     print("--- Training finished. ---")
 
@@ -270,11 +287,31 @@ def main():
     config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     config.VISUALIZATION_DIR.mkdir(parents=True, exist_ok=True)
 
+
+    # --- MODIFIED: Define separate augmentation pipelines ---
+    photometric_transforms = transforms.Compose([
+        # Note: torchvision's ColorJitter expects image values in range [0, 1].
+        # Since our images are [0, 255], we wrap it with conversions.
+        #transforms.ConvertImageDtype(torch.float),
+        #transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+        #transforms.ConvertImageDtype(torch.uint8), # Convert back for GaussianBlur
+        # GaussianBlur expects a tensor, so we need to ensure our image is one
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))
+    ])
+
+    geometric_transforms = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(degrees=(-45,45)),
+    ])
+
+
     # --- Initialize Datasets ---
     print("Loading datasets...")
-    train_dataset = PreprocessedBinaryVegDataset(config.TRAIN_DIR)
-    val_dataset = PreprocessedBinaryVegDataset(config.VAL_DIR)
-    test_dataset = PreprocessedBinaryVegDataset(config.TEST_DIR)
+    # Pass augmentations ONLY to the training dataset
+    train_dataset = PreprocessedBinaryVegDataset(config.TRAIN_DIR, photometric_augs=photometric_transforms, geometric_augs=geometric_transforms)
+    val_dataset = PreprocessedBinaryVegDataset(config.VAL_DIR) # No augmentations for validation
+    test_dataset = PreprocessedBinaryVegDataset(config.TEST_DIR) # No augmentations for test
 
     if len(train_dataset) == 0 or train_dataset.num_input_channels is None:
         print("Error: Training dataset is empty. Preprocessing might have failed. Exiting.")
