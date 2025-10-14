@@ -14,30 +14,23 @@ import numpy as np
 
 # Import from our config and utils files
 import config
-from utils import create_inference_visualization, set_seed, save_loss_plot, apply_fda
+from utils import create_inference_visualization, set_seed, save_loss_plot
 
-# --- Dataset Class (Unchanged from previous correct version) ---
+# --- Dataset Class with Simplified Augmentations for RGB Data ---
 class PreprocessedBinaryVegDataset(Dataset):
-    def __init__(self, data_dir: Path, style_dir: Path, use_fda: bool = False, photometric_augs=None, geometric_augs=None):
+    def __init__(self, data_dir: Path, photometric_augs=None, geometric_augs=None):
         self.data_dir = data_dir
-        self.style_dir = style_dir
-        self.use_fda = use_fda
         self.photometric_augs = photometric_augs
         self.geometric_augs = geometric_augs
         self.patch_basenames: List[str] = []
-        self.style_paths: List[Path] = []
-        if not data_dir.exists():
-            print(f"Warning: Data directory not found: {self.data_dir}")
+        if not self.data_dir.exists():
+            print(f"Warning: Data directory not found: {self.data_dir}"); return
+        for h5_file in self.data_dir.glob("*_source.h5"):
+            self.patch_basenames.append(h5_file.name.replace("_source.h5", ""))
+        if not self.patch_basenames:
+            print(f"Warning: No patches found in {self.data_dir}")
         else:
-            self.patch_basenames = [p.name.replace("_source.h5", "") for p in data_dir.glob("*_source.h5")]
-            if not self.patch_basenames:
-                print(f"Warning: No patches found in {self.data_dir}")
-            else:
-                print(f"  Dataset for {data_dir.name}: Found {len(self.patch_basenames)} samples.")
-        if style_dir and style_dir.exists():
-            self.style_paths = list(style_dir.glob("*.h5"))
-        if self.use_fda and not self.style_paths:
-            print(f"    - FDA is enabled for {data_dir.name}, but no style images were found. FDA will not be applied.")
+            print(f"  Dataset for {data_dir.name}: Found {len(self.patch_basenames)} samples.")
         self.num_input_channels: Optional[int] = None
         if self.patch_basenames:
             with h5py.File(self.data_dir / f"{self.patch_basenames[0]}_source.h5", "r") as hf:
@@ -50,36 +43,30 @@ class PreprocessedBinaryVegDataset(Dataset):
         basename = self.patch_basenames[idx]
         try:
             with h5py.File(self.data_dir / f"{basename}_source.h5", "r") as hf:
-                image = torch.from_numpy(hf["image"][:])
+                image = torch.from_numpy(hf["image"][:].astype(np.float32))
             with h5py.File(self.data_dir / f"{basename}_target_binary.h5", "r") as hf:
-                target = torch.from_numpy(hf["target"][:]).unsqueeze(0)
+                target = torch.from_numpy(hf["target"][:].astype(np.float32)).unsqueeze(0)
             with h5py.File(self.data_dir / f"{basename}_mask_binary.h5", "r") as hf:
-                mask = torch.from_numpy(hf["mask"][:]).unsqueeze(0)
+                mask = torch.from_numpy(hf["mask"][:].astype(np.float32)).unsqueeze(0)
 
-            style_image = torch.zeros_like(image)
-
-            if self.use_fda and self.style_paths and random.random() < 0.5:
-                with h5py.File(random.choice(self.style_paths), "r") as hf:
-                    style_image = torch.from_numpy(hf["style_image"][:])
-                image = apply_fda(image.byte(), style_image.byte(), beta=0.05)
-
-            if self.use_fda and self.style_paths and random.random() < config.FDA_AUGMENTATION_PROBABILITY:
-                with h5py.File(random.choice(self.style_paths), "r") as hf:
-                    style_image = torch.from_numpy(hf["style_image"][:])
-
+            # --- SIMPLIFIED AUGMENTATION LOGIC ---
+            # Now that the data is 3-channel, this logic is much simpler.
+            
+            # 1. Apply photometric augmentations directly to the 3-channel image.
             if self.photometric_augs:
-                image = self.photometric_augs(image.byte())
+                image = self.photometric_augs(image)
 
+            # 2. Apply geometric augmentations to everything consistently.
             if self.geometric_augs:
-                stacked = torch.cat((image, target, mask, style_image), dim=0)
+                stacked = torch.cat((image, target, mask), dim=0)
                 augmented = self.geometric_augs(stacked)
-                image, target, mask, style_image = torch.split(augmented, [self.num_input_channels, 1, 1, self.num_input_channels], dim=0)
+                image, target, mask = torch.split(augmented, [self.num_input_channels, 1, 1], dim=0)
 
-            return {'image': image.float(), 'target': target.float(), 'mask': mask.float(), 'style_image': style_image.float()}
+            return {'image': image, 'target': target, 'mask': mask}
         except Exception as e:
             print(f"Error loading HDF5 file for basename {basename}: {e}"); raise
 
-# --- U-Net Helper Classes and Model ---
+# --- U-Net and Loss Classes (Unchanged) ---
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels, mid_channels=None):
         super().__init__()
@@ -91,11 +78,13 @@ class DoubleConv(nn.Module):
             nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
         )
     def forward(self, x): return self.double_conv(x)
+
 class Down(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.maxpool_conv = nn.Sequential(nn.MaxPool2d(2), DoubleConv(in_channels, out_channels))
     def forward(self, x): return self.maxpool_conv(x)
+
 class Up(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -107,6 +96,7 @@ class Up(nn.Module):
         x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
         x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
+
 class OutConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(OutConv, self).__init__(); self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
@@ -119,21 +109,11 @@ class SimpleUNet(nn.Module):
         self.down3 = Down(256, 512); self.down4 = Down(512, 1024)
         self.up1 = Up(1024, 512); self.up2 = Up(512, 256); self.up3 = Up(256, 128)
         self.up4 = Up(128, 64); self.outc = OutConv(64, out_channels)
-
     def forward(self, x):
         x1 = self.inc(x); x2 = self.down1(x1); x3 = self.down2(x2); x4 = self.down3(x3); x5 = self.down4(x4)
-        x = self.up1(x5, x4); x = self.up2(x, x3); x = self.up3(x, x2)
-        features = self.up4(x, x1)
-        logits = self.outc(features)
+        x = self.up1(x5, x4); x = self.up2(x, x3); x = self.up3(x, x2); x = self.up4(x, x1)
+        return self.outc(x)
 
-        # --- THIS IS THE FIX ---
-        # Only return features during training for the invariance loss
-        if self.training:
-            return logits, features
-        else:
-            return logits
-
-# --- Masked Loss Function ---
 class MaskedBCELoss(nn.Module):
     def __init__(self):
         super().__init__(); self.criterion = nn.BCEWithLogitsLoss(reduction='none')
@@ -142,70 +122,48 @@ class MaskedBCELoss(nn.Module):
         num_valid_pixels = mask.sum().clamp(min=1)
         return masked_loss.sum() / num_valid_pixels
 
-# --- Training Loop ---
+# --- Training and Validation Loop (Unchanged) ---
 def train_model(model, train_dataset, val_dataset, test_dataset, criterion, optimizer, num_epochs, device):
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
     print(f"--- Starting training on {device} ---")
-
     best_val_loss = float('inf')
     train_losses, val_losses = [], []
-    invariance_criterion = nn.MSELoss()
-
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
-
         for batch in pbar:
-            inputs, targets, masks, style_images = \
-                batch['image'].to(device), batch['target'].to(device), batch['mask'].to(device), batch['style_image'].to(device)
-
-            inputs_augmented = torch.clamp(inputs + style_images, 0, 255)
+            inputs, targets, masks = batch['image'].to(device), batch['target'].to(device), batch['mask'].to(device)
             optimizer.zero_grad()
-
-            # During training, model returns two values
-            outputs_clean, features_clean = model(inputs)
-            outputs_aug, features_aug = model(inputs_augmented)
-
-            segmentation_loss = criterion(outputs_clean, targets, masks)
-            invariance_loss = invariance_criterion(features_clean, features_aug)
-            total_loss = segmentation_loss + (config.INVARIANCE_LOSS_WEIGHT * invariance_loss)
-
-            if torch.isfinite(total_loss):
-                total_loss.backward(); optimizer.step()
-                running_loss += total_loss.item()
-                pbar.set_postfix(seg_loss=f"{segmentation_loss.item():.4f}", inv_loss=f"{invariance_loss.item():.4f}")
-
+            outputs = model(inputs)
+            loss = criterion(outputs, targets, masks)
+            if torch.isfinite(loss):
+                loss.backward(); optimizer.step()
+                running_loss += loss.item()
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
         avg_train_loss = running_loss / len(train_loader)
-
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
-                inputs, targets, masks, _ = batch['image'].to(device), batch['target'].to(device), batch['mask'].to(device), batch['style_image']
-
-                # --- THIS IS THE FIX ---
-                # During eval, model only returns one value
+                inputs, targets, masks = batch['image'].to(device), batch['target'].to(device), batch['mask'].to(device)
                 outputs = model(inputs)
                 loss = criterion(outputs, targets, masks)
                 val_loss += loss.item()
-
         avg_val_loss = val_loss / len(val_loader)
-
-        train_losses.append(avg_train_loss); val_losses.append(avg_val_loss)
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
         print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), config.CHECKPOINT_DIR / "best_model_binary.pth")
             print(f"  -> New best model saved with val loss: {best_val_loss:.4f}")
-
         save_loss_plot(train_losses, val_losses, config.VISUALIZATION_DIR / "loss_curve.png")
+        print(f"--- Generating visualizations for Epoch {epoch+1} ---")
         create_inference_visualization(model, train_dataset, device, config.VISUALIZATION_DIR, epoch=epoch + 1, num_samples=10, split_name='train')
         create_inference_visualization(model, val_dataset, device, config.VISUALIZATION_DIR, epoch=epoch + 1, num_samples=10, split_name='val')
         create_inference_visualization(model, test_dataset, device, config.VISUALIZATION_DIR, epoch=epoch + 1, num_samples=10, split_name='test')
-
     print("--- Training finished. ---")
 
 def main():
@@ -213,42 +171,44 @@ def main():
     config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     config.VISUALIZATION_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Note: These transforms now assume a 3-channel input and will work correctly.
     photometric_transforms = transforms.Compose([
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
         transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))
     ])
+
     geometric_transforms = transforms.Compose([
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(degrees=(-45,45)),
+        transforms.RandomRotation(degrees=15),
     ])
 
     print("Loading datasets...")
-
-    style_dir = config.PREPROCESSED_DATA_DIR / "style_images"
-
     train_dataset = PreprocessedBinaryVegDataset(
-        config.TRAIN_DIR, style_dir=style_dir, use_fda=True,
-        photometric_augs=photometric_transforms, geometric_augs=geometric_transforms
+        config.TRAIN_DIR,
+        photometric_augs=photometric_transforms,
+        geometric_augs=geometric_transforms
     )
-    val_dataset = PreprocessedBinaryVegDataset(config.VAL_DIR, style_dir=style_dir, use_fda=False)
-    test_dataset = PreprocessedBinaryVegDataset(config.TEST_DIR, style_dir=style_dir, use_fda=False)
+    val_dataset = PreprocessedBinaryVegDataset(config.VAL_DIR)
+    test_dataset = PreprocessedBinaryVegDataset(config.TEST_DIR)
 
     if len(train_dataset) == 0 or train_dataset.num_input_channels is None:
-        print("Error: Training dataset is empty. Exiting."); return
-
+        print("Error: Training dataset is empty. Preprocessing might have failed. Exiting.")
+        return
+        
     print(f"Initializing model with {train_dataset.num_input_channels} input channels.")
+    # The model will now be correctly initialized with in_channels=3
     model = SimpleUNet(in_channels=train_dataset.num_input_channels, out_channels=1).to(config.DEVICE)
     criterion = MaskedBCELoss()
     optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
-
+    
     if len(train_dataset) > 0 and len(val_dataset) > 0:
         train_model(model, train_dataset, val_dataset, test_dataset, criterion, optimizer, config.NUM_EPOCHS, config.DEVICE)
     else:
         print("Warning: Train or validation loader is empty. Skipping training.")
 
     print(f"\nScript finished. Best model saved to: '{config.CHECKPOINT_DIR / 'best_model_binary.pth'}'")
-    print(f"Visualizations and loss curve saved in: '{config.VISUALIZATION_DIR}'")
+    print(f"Per-epoch visualizations and loss curve saved in: '{config.VISUALIZATION_DIR}'")
 
 if __name__ == "__main__":
     main()
-
