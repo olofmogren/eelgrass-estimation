@@ -18,7 +18,7 @@ import shutil
 # Import from config
 import config
 
-# --- (Functions from get_vegetation_columns to process_geotiff_and_annotations remain unchanged) ---
+# --- (Functions from get_vegetation_columns to extract_style_patches remain unchanged) ---
 
 def get_vegetation_columns(df: pd.DataFrame) -> list:
     """Identifies the correct vegetation column names from the dataframe."""
@@ -111,7 +111,7 @@ def extract_style_patches(train_dir: Path, style_dir: Path):
     print("--- Finished Extracting Style Images ---")
 
 def process_geotiff_and_annotations(tif_path: Path, master_annotations_gdf: geopandas.GeoDataFrame, roi_polygon_wgs84: Polygon, output_dir: Path):
-    """Processes a GeoTIFF by generating patches with 7x7 (config.ANNOTATION_SQUARE_SIZE) target squares."""
+    """Processes a GeoTIFF by generating patches with circular annotations of a specified radius."""
     total_patches_generated_for_file = 0
     total_discarded_for_file = 0
     try:
@@ -127,7 +127,6 @@ def process_geotiff_and_annotations(tif_path: Path, master_annotations_gdf: geop
             veg_cols = get_vegetation_columns(annotations_in_roi)
             if not veg_cols: return 0, 0
             annotations_in_roi[veg_cols] = annotations_in_roi[veg_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
-            # This print statement can be noisy if you have many files, but is good for debugging
             print(f"  -> SUCCESS: Found {len(annotations_in_roi)} valid annotations for {tif_path.name}. Generating patches...")
             for ann_idx, annotation in annotations_in_roi.iterrows():
                 try:
@@ -157,12 +156,15 @@ def process_geotiff_and_annotations(tif_path: Path, master_annotations_gdf: geop
                             abs_row, abs_col = src.index(ann_in_patch.geometry.x, ann_in_patch.geometry.y)
                             rel_row, rel_col = abs_row - top, abs_col - left
                             if not (0 <= rel_row < h and 0 <= rel_col < w): continue
-                            square_size = config.ANNOTATION_SQUARE_SIZE; offset = square_size // 2
-                            r_min, r_max = max(0, rel_row - offset), min(h, rel_row + offset + 1)
-                            c_min, c_max = max(0, rel_col - offset), min(w, rel_col + offset + 1)
-                            mask_binary[r_min:r_max, c_min:c_max] = 1
+
+                            # Create circular annotation
+                            Y, X = np.ogrid[:h, :w]
+                            dist_from_center = np.sqrt((X - rel_col)**2 + (Y - rel_row)**2)
+                            circle_mask = dist_from_center <= config.ANNOTATION_RADIUS
+
+                            mask_binary[circle_mask] = 1
                             if ann_in_patch[veg_cols].sum() >= 40:
-                                target_binary[r_min:r_max, c_min:c_max] = 1
+                                target_binary[circle_mask] = 1
                         except Exception: continue
                     total_patches_generated_for_file += 1
                     base_name = f"{tif_path.stem}_patch_{ann_idx}_{i}"
@@ -175,14 +177,14 @@ def process_geotiff_and_annotations(tif_path: Path, master_annotations_gdf: geop
         print(f"FATAL: Failed to process GeoTIFF {tif_path.name}. Error: {e}")
         return 0, 0
 
-# --- NEW FUNCTION ---
+# --- (Functions from split_and_move_patches to main remain unchanged) ---
+
 def split_and_move_patches(all_patches_dir: Path, output_dir: Path):
     """
     Shuffles all generated patches and splits them into train, val, and test sets.
     """
     print("\n--- Splitting generated patches into train, validation, and test sets ---")
 
-    # Get unique basenames of all generated patches from the source files
     source_files = list(all_patches_dir.glob("*_source.h5"))
     if not source_files:
         print("Warning: No patches were generated. Cannot create splits.")
@@ -191,12 +193,10 @@ def split_and_move_patches(all_patches_dir: Path, output_dir: Path):
     basenames = [p.name.replace("_source.h5", "") for p in source_files]
     random.shuffle(basenames)
 
-    # Calculate split sizes: 20% for test, 10% for validation
     total_patches = len(basenames)
     test_size = int(total_patches * 0.20)
     val_size = int(total_patches * 0.10)
 
-    # Distribute the patches
     test_patches = basenames[:test_size]
     val_patches = basenames[test_size : test_size + val_size]
     train_patches = basenames[test_size + val_size :]
@@ -207,14 +207,12 @@ def split_and_move_patches(all_patches_dir: Path, output_dir: Path):
     print(f"  - Test set size:       {len(test_patches)} patches (~{100*len(test_patches)/total_patches:.1f}%)")
     print("------------------------------------------------------------------")
 
-    # Define final split directories
     split_dirs = {
         "train": output_dir / "train",
         "val": output_dir / "val",
         "test": output_dir / "test"
     }
 
-    # Helper function to move files for a given list of basenames
     def move_files(patch_list, dest_dir):
         dest_dir.mkdir(parents=True, exist_ok=True)
         for basename in tqdm(patch_list, desc=f"Moving files to {dest_dir.name}"):
@@ -222,12 +220,10 @@ def split_and_move_patches(all_patches_dir: Path, output_dir: Path):
             shutil.move(str(all_patches_dir / f"{basename}_target_binary.h5"), str(dest_dir))
             shutil.move(str(all_patches_dir / f"{basename}_mask_binary.h5"), str(dest_dir))
 
-    # Move the files to their final destinations
     move_files(train_patches, split_dirs["train"])
     move_files(val_patches, split_dirs["val"])
     move_files(test_patches, split_dirs["test"])
 
-    # Clean up the temporary directory
     shutil.rmtree(all_patches_dir)
     print("\nPatch splitting and moving complete.")
 
@@ -247,7 +243,6 @@ def main():
     if years_to_process:
         print(f"Filtering dataset to include only years: {', '.join(years_to_process)}")
 
-    # --- (Annotation and GeoTIFF loading/filtering logic remains the same) ---
     all_xlsx_paths = list(data_dir.glob("**/*.xlsx"))
     if years_to_process:
         initial_count = len(all_xlsx_paths)
@@ -281,14 +276,10 @@ def main():
     except Exception as e:
         print(f"Error during ROI processing: {e}. Aborting."); return
 
-    # --- ENTIRE DATA SPLIT LOGIC IS REPLACED ---
-
-    # 1. Create a single temporary directory to store ALL generated patches
     all_patches_dir = output_dir / "all_patches"
     if all_patches_dir.exists(): shutil.rmtree(all_patches_dir)
     all_patches_dir.mkdir(parents=True)
 
-    # Clean out old final directories
     if config.TRAIN_DIR.exists(): shutil.rmtree(config.TRAIN_DIR)
     if config.VAL_DIR.exists(): shutil.rmtree(config.VAL_DIR)
     if config.TEST_DIR.exists(): shutil.rmtree(config.TEST_DIR)
@@ -296,13 +287,12 @@ def main():
     print("\n--- Generating all patches from relevant GeoTIFFs into a temporary directory ---")
     total_generated = 0
     total_discarded = 0
-    # 2. Process all relevant GeoTIFFs and save patches to the temporary directory
     for tif_path in tqdm(relevant_geotiffs, desc="Processing GeoTIFFs"):
         generated, discarded = process_geotiff_and_annotations(
             tif_path,
             master_annotations_gdf,
             roi_poly_wgs84,
-            all_patches_dir  # Save all patches to one central place
+            all_patches_dir
         )
         total_generated += generated
         total_discarded += discarded
@@ -311,13 +301,11 @@ def main():
     print(f"  - Total patches generated: {total_generated}")
     print(f"  - Total patches discarded: {total_discarded}")
 
-    # 3. Now, split all the generated patches into train, val, and test sets
     if total_generated > 0:
         split_and_move_patches(all_patches_dir, output_dir)
     else:
         print("\nNo patches were generated, skipping split.")
 
-    # 4. Extract style images from the final training set that was just created
     if config.TRAIN_DIR.exists():
         extract_style_patches(config.TRAIN_DIR, config.STYLE_IMAGES_DIR)
 

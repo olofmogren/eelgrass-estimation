@@ -14,9 +14,10 @@ from pyproj import Transformer
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch
+import fiona.path
 
 # --- Import your model and helper functions ---
-from unetpp_model import UNetPlusPlus # Make sure this matches your model file name
+from unetplusplus import Model # Make sure this matches your model file name
 from preprocess_data import get_vegetation_columns
 import config
 
@@ -78,7 +79,7 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
             
             # --- BUG FIX ---
             # When model is in .eval() mode, it only returns the final logits
-            logits = model(images)
+            _, _, _, logits, _ = model(images)
             
             preds = torch.sigmoid(logits).cpu().numpy()
             for i in range(preds.shape[0]):
@@ -178,7 +179,7 @@ def main():
     print(f"Loading model from {args.model_path}")
     # --- BUG FIX ---
     # Ensure you are importing the correct model class name
-    model = UNetPlusPlus(in_channels=3, out_channels=1).to(device) 
+    model = Model(in_channels=3, out_channels=1).to(device) 
     model.load_state_dict(torch.load(args.model_path, map_location=device))
     model.eval()
 
