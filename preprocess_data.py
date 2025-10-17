@@ -14,11 +14,12 @@ from rasterio.windows import Window
 from pyproj import Transformer, CRS
 from tqdm import tqdm
 import shutil
+from scipy.ndimage import gaussian_filter
 
 # Import from config
 import config
 
-# --- (Functions from get_vegetation_columns to extract_style_patches remain unchanged) ---
+# --- (Functions from get_vegetation_columns to process_geotiff_and_annotations remain unchanged) ---
 
 def get_vegetation_columns(df: pd.DataFrame) -> list:
     """Identifies the correct vegetation column names from the dataframe."""
@@ -79,36 +80,54 @@ def get_roi_overlapping_geotiffs(geotiff_paths: list, roi_poly_wgs84: Polygon) -
             print(f"Warning: Could not process {tif_path.name} for ROI check. Error: {e}")
     return overlapping_files
 
-def extract_style_patches(train_dir: Path, style_dir: Path):
+def extract_style_patches(train_dir: Path, style_dir: Path, grayscale: bool = False, num_styles: int = 200, sigma: int = 3):
     """
-    Scans generated training patches and saves a selection to be used as 'style' images for FDA.
+    Applies a Gaussian filter to training patches to extract high-frequency patterns,
+    saving them as style images.
     """
-    print("\n--- Extracting Style Images from Training Patches ---")
-    style_metadata = []
+    print("\n--- Extracting Style Images using Gaussian High-Pass Filter ---")
     train_patch_paths = list(train_dir.glob("*_source.h5"))
-    for patch_path in tqdm(train_patch_paths, desc="Scanning training patches for styles"):
-        with h5py.File(patch_path, 'r') as hf:
-            patch = hf['image'][:]
-            if patch.shape[0] < 3: continue
-            score = np.std(patch)
-            if score > 20:
-                style_metadata.append({'path': patch_path, 'score': score})
-    if not style_metadata:
-        print("Warning: No suitable style patches found. FDA will not be available.")
+
+    if not train_patch_paths:
+        print("Warning: No training patches found. Cannot generate style images.")
         return
-    style_metadata.sort(key=lambda x: x['score'], reverse=True)
-    num_to_keep = max(1, len(style_metadata) // 4)
-    top_styles_metadata = style_metadata[:num_to_keep]
-    print(f"Found {len(style_metadata)} potential style patches. Keeping and copying the top {len(top_styles_metadata)}.")
+
+    # Select a random subset of patches to process
+    num_to_process = min(num_styles, len(train_patch_paths))
+    selected_patches = random.sample(train_patch_paths, num_to_process)
+    print(f"Randomly selected {num_to_process} training patches to generate style images.")
+    if grayscale:
+        print("Style images will be converted to 3-channel grayscale.")
+
     style_dir.mkdir(parents=True, exist_ok=True)
     for f in style_dir.glob('*.h5'):
         f.unlink()
-    for i, patch_info in enumerate(tqdm(top_styles_metadata, desc="Copying best style images")):
-        with h5py.File(patch_info['path'], 'r') as hf_in:
-             patch = hf_in['image'][:]
+
+    for i, patch_path in enumerate(tqdm(selected_patches, desc="Generating style images")):
+        with h5py.File(patch_path, 'r') as hf:
+            original_image = hf['image'][:]
+
+        if original_image.shape[0] < 3: continue # Ensure it's a 3-channel image
+
+        # Apply low-pass filter to get the blurred version
+        low_freq = gaussian_filter(original_image, sigma=[0, sigma, sigma])
+
+        # Subtract low-frequency from original to get high-frequency content
+        high_freq = original_image - low_freq
+
+        style_image = high_freq
+        if grayscale:
+            # Calculate grayscale by averaging the channels
+            gray_channel = np.mean(style_image, axis=0, keepdims=True)
+            # Repeat the gray channel 3 times to get a (3, H, W) image
+            style_image = np.repeat(gray_channel, 3, axis=0)
+
+        # Save the resulting style image
         with h5py.File(style_dir / f"style_{i:05d}.h5", "w") as hf_out:
-            hf_out.create_dataset("style_image", data=patch)
+            hf_out.create_dataset("style_image", data=style_image)
+
     print("--- Finished Extracting Style Images ---")
+
 
 def process_geotiff_and_annotations(tif_path: Path, master_annotations_gdf: geopandas.GeoDataFrame, roi_polygon_wgs84: Polygon, output_dir: Path):
     """Processes a GeoTIFF by generating patches with circular annotations of a specified radius."""
@@ -233,6 +252,7 @@ def main():
     parser.add_argument("--data_dir", type=str, default=str(config.DATA_DIR), help="Path to the root data directory.")
     parser.add_argument("--output_dir", type=str, default=str(config.PREPROCESSED_DATA_DIR), help="Path to the output directory.")
     parser.add_argument("--years", type=str, default=None, help="Optional: Comma-separated list of years to process (e.g., '2023,2024').")
+    parser.add_argument("--grayscale_style", action='store_true', help="Convert style images to 3-channel grayscale.")
     args = parser.parse_args()
 
     random.seed(config.GLOBAL_RANDOM_SEED)
@@ -307,7 +327,7 @@ def main():
         print("\nNo patches were generated, skipping split.")
 
     if config.TRAIN_DIR.exists():
-        extract_style_patches(config.TRAIN_DIR, config.STYLE_IMAGES_DIR)
+        extract_style_patches(config.TRAIN_DIR, config.STYLE_IMAGES_DIR, grayscale=args.grayscale_style)
 
     print("\n--- Preprocessing Complete ---")
 
