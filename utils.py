@@ -107,7 +107,7 @@ def create_inference_visualization(model, dataset: Dataset, device: torch.device
             
             # --- THIS IS THE FIX ---
             # During eval, model only returns logits
-            outputs = model(inputs.to(device))
+            _, _, _, outputs, _ = model(inputs.to(device))
             preds = torch.sigmoid(outputs) > 0.5
 
             img_np = inputs[0].cpu().numpy()
@@ -164,3 +164,73 @@ def create_inference_visualization(model, dataset: Dataset, device: torch.device
     plt.savefig(split_output_dir / filename, dpi=120, bbox_inches='tight')
     plt.close(fig)
 
+def calculate_metrics(preds: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor):
+    """
+    Calculates the number of true positives, false positives, and false negatives
+    within the masked regions.
+    Args:
+        preds: The binary prediction tensor from the model (B, 1, H, W).
+        targets: The ground truth tensor (B, 1, H, W).
+        mask: The mask tensor to apply (B, 1, H, W).
+    Returns:
+        A tuple containing the total true positives, false positives, and false negatives.
+    """
+    # Ensure tensors are boolean
+    preds = preds.bool()
+    targets = targets.bool()
+
+    # Apply the mask to ignore irrelevant pixels
+    preds_masked = preds[mask == 1]
+    targets_masked = targets[mask == 1]
+
+    tp = (preds_masked & targets_masked).sum()
+    fp = (preds_masked & ~targets_masked).sum()
+    fn = (~preds_masked & targets_masked).sum()
+
+    return tp, fp, fn
+
+def save_metrics_plot(train_metrics: list, val_metrics: list, output_path: Path):
+    """
+    Generates and saves a plot of training and validation metrics (Precision, Recall, F1).
+    Args:
+        train_metrics: A list of dicts, where each dict contains {'precision', 'recall', 'f1'} for training.
+        val_metrics: A list of dicts for validation metrics.
+        output_path: The path to save the PNG file.
+    """
+    epochs = range(1, len(train_metrics) + 1)
+
+    plt.figure(figsize=(15, 5))
+
+    # Plot Precision
+    plt.subplot(1, 3, 1)
+    plt.plot(epochs, [m['precision'] for m in train_metrics], 'b-o', label='Train Precision')
+    plt.plot(epochs, [m['precision'] for m in val_metrics], 'r-o', label='Val Precision')
+    plt.title('Precision over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Precision')
+    plt.grid(True)
+    plt.legend()
+
+    # Plot Recall
+    plt.subplot(1, 3, 2)
+    plt.plot(epochs, [m['recall'] for m in train_metrics], 'b-o', label='Train Recall')
+    plt.plot(epochs, [m['recall'] for m in val_metrics], 'r-o', label='Val Recall')
+    plt.title('Recall over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Recall')
+    plt.grid(True)
+    plt.legend()
+
+    # Plot F1 Score
+    plt.subplot(1, 3, 3)
+    plt.plot(epochs, [m['f1'] for m in train_metrics], 'b-o', label='Train F1 Score')
+    plt.plot(epochs, [m['f1'] for m in val_metrics], 'r-o', label='Val F1 Score')
+    plt.title('F1 Score over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('F1 Score')
+    plt.grid(True)
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()

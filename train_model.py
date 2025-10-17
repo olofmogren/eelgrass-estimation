@@ -14,7 +14,10 @@ import numpy as np
 
 # Import from our config and utils files
 import config
-from utils import create_inference_visualization, set_seed, save_loss_plot, apply_fda
+from utils import create_inference_visualization, set_seed, save_loss_plot
+from utils import apply_fda, calculate_metrics, save_metrics_plot
+
+from unetplusplus import Model
 
 # --- Dataset Class (Unchanged from previous correct version) ---
 class PreprocessedBinaryVegDataset(Dataset):
@@ -75,63 +78,10 @@ class PreprocessedBinaryVegDataset(Dataset):
                 augmented = self.geometric_augs(stacked)
                 image, target, mask, style_image = torch.split(augmented, [self.num_input_channels, 1, 1, self.num_input_channels], dim=0)
 
-            return {'image': image.float(), 'target': target.float(), 'mask': mask.float(), 'style_image': style_image.float()}
+            #return {'image': image.float(), 'target': target.float(), 'mask': mask.float(), 'style_image': style_image.float()}
+            return {'image': image.float(), 'target': target.float(), 'mask': mask.float(), 'style_image': style_image.float()} # NORMALIZED IMAGE
         except Exception as e:
             print(f"Error loading HDF5 file for basename {basename}: {e}"); raise
-
-# --- U-Net Helper Classes and Model ---
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels, mid_channels=None):
-        super().__init__()
-        if not mid_channels: mid_channels = out_channels
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels), nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
-        )
-    def forward(self, x): return self.double_conv(x)
-class Down(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.maxpool_conv = nn.Sequential(nn.MaxPool2d(2), DoubleConv(in_channels, out_channels))
-    def forward(self, x): return self.maxpool_conv(x)
-class Up(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-        self.conv = DoubleConv(in_channels, out_channels)
-    def forward(self, x1, x2):
-        x1 = self.up(x1)
-        diffY = x2.size()[2] - x1.size()[2]; diffX = x2.size()[3] - x1.size()[3]
-        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
-        x = torch.cat([x2, x1], dim=1)
-        return self.conv(x)
-class OutConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(OutConv, self).__init__(); self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-    def forward(self, x): return self.conv(x)
-
-class SimpleUNet(nn.Module):
-    def __init__(self, in_channels, out_channels=1):
-        super(SimpleUNet, self).__init__()
-        self.inc = DoubleConv(in_channels, 64); self.down1 = Down(64, 128); self.down2 = Down(128, 256)
-        self.down3 = Down(256, 512); self.down4 = Down(512, 1024)
-        self.up1 = Up(1024, 512); self.up2 = Up(512, 256); self.up3 = Up(256, 128)
-        self.up4 = Up(128, 64); self.outc = OutConv(64, out_channels)
-
-    def forward(self, x):
-        x1 = self.inc(x); x2 = self.down1(x1); x3 = self.down2(x2); x4 = self.down3(x3); x5 = self.down4(x4)
-        x = self.up1(x5, x4); x = self.up2(x, x3); x = self.up3(x, x2)
-        features = self.up4(x, x1)
-        logits = self.outc(features)
-
-        # --- THIS IS THE FIX ---
-        # Only return features during training for the invariance loss
-        if self.training:
-            return logits, features
-        else:
-            return logits
 
 # --- Masked Loss Function ---
 class MaskedBCELoss(nn.Module):
@@ -149,12 +99,15 @@ def train_model(model, train_dataset, val_dataset, test_dataset, criterion, opti
     print(f"--- Starting training on {device} ---")
 
     best_val_loss = float('inf')
+    best_val_f1 = 0.0 # not yet used, but could be used to save best model below
     train_losses, val_losses = [], []
+    train_metrics_history, val_metrics_history = [], [] # Added lists for metrics
     invariance_criterion = nn.MSELoss()
 
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
+        train_tp, train_fp, train_fn = 0, 0, 0 # Added metric counters for training
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
 
         for batch in pbar:
@@ -165,10 +118,19 @@ def train_model(model, train_dataset, val_dataset, test_dataset, criterion, opti
             optimizer.zero_grad()
 
             # During training, model returns two values
-            outputs_clean, features_clean = model(inputs)
-            outputs_aug, features_aug = model(inputs_augmented)
+            logits_clean1, logits_clean2, logits_clean3, final_logits_clean, features_clean = model(inputs)
+            _, _, _, _, features_aug = model(inputs_augmented)
 
-            segmentation_loss = criterion(outputs_clean, targets, masks)
+            if config.DEEP_SUPERVISION:
+                loss1 = criterion(logits_clean1, targets, masks)
+                loss2 = criterion(logits_clean2, targets, masks)
+                loss3 = criterion(logits_clean3, targets, masks)
+                loss4 = criterion(final_logits_clean, targets, masks) # The main output
+
+                # Combine the losses
+                segmentation_loss = loss1 + loss2 + loss3 + loss4
+            else:
+                segmentation_loss = criterion(final_logits_clean, targets, masks)
             invariance_loss = invariance_criterion(features_clean, features_aug)
             total_loss = segmentation_loss + (config.INVARIANCE_LOSS_WEIGHT * invariance_loss)
 
@@ -176,32 +138,69 @@ def train_model(model, train_dataset, val_dataset, test_dataset, criterion, opti
                 total_loss.backward(); optimizer.step()
                 running_loss += total_loss.item()
                 pbar.set_postfix(seg_loss=f"{segmentation_loss.item():.4f}", inv_loss=f"{invariance_loss.item():.4f}")
+            else:
+                print('loss is inf!')
+
+            # Calculate and accumulate training metrics for the batch
+            preds = torch.sigmoid(final_logits_clean) > 0.5
+            tp, fp, fn = calculate_metrics(preds, targets, masks)
+            train_tp += tp.item()
+            train_fp += fp.item()
+            train_fn += fn.item()
 
         avg_train_loss = running_loss / len(train_loader)
 
+        # Calculate and store epoch-level training metrics
+        train_precision = train_tp / (train_tp + train_fp + 1e-6)
+        train_recall = train_tp / (train_tp + train_fn + 1e-6)
+        train_f1 = 2 * (train_precision * train_recall) / (train_precision + train_recall + 1e-6)
+        train_losses.append(avg_train_loss);
+        train_metrics_history.append({'precision': train_precision, 'recall': train_recall, 'f1': train_f1})
+
         model.eval()
         val_loss = 0.0
+        val_tp, val_fp, val_fn = 0, 0, 0 # Added metric counters for validation
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
                 inputs, targets, masks, _ = batch['image'].to(device), batch['target'].to(device), batch['mask'].to(device), batch['style_image']
 
                 # --- THIS IS THE FIX ---
                 # During eval, model only returns one value
-                outputs = model(inputs)
-                loss = criterion(outputs, targets, masks)
+                _, _, _, logits, _ = model(inputs)
+                loss = criterion(logits, targets, masks)
                 val_loss += loss.item()
 
+                # Calculate and accumulate validation metrics for the batch
+                preds = torch.sigmoid(logits) > 0.5
+                tp, fp, fn = calculate_metrics(preds, targets, masks)
+                val_tp += tp.item()
+                val_fp += fp.item()
+                val_fn += fn.item()
+
         avg_val_loss = val_loss / len(val_loader)
+        # Calculate and store epoch-level validation metrics
+        val_precision = val_tp / (val_tp + val_fp + 1e-6)
+        val_recall = val_tp / (val_tp + val_fn + 1e-6)
+        val_f1 = 2 * (val_precision * val_recall) / (val_precision + val_recall + 1e-6)
+        val_losses.append(avg_val_loss)
+        val_metrics_history.append({'precision': val_precision, 'recall': val_recall, 'f1': val_f1})
+        # Updated print statement to include F1 score
+        print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val F1: {val_f1:.4f}")
 
-        train_losses.append(avg_train_loss); val_losses.append(avg_val_loss)
-        print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
+        # Best model is now saved based on F1 score
+        #if val_f1 > best_val_f1:
+        #    best_val_f1 = val_f1
+        #    torch.save(model.state_dict(), config.CHECKPOINT_DIR / "best_model_binary.pth")
+        #    print(f"  -> New best model saved with val F1: {best_val_f1:.4f}")
+        
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), config.CHECKPOINT_DIR / "best_model_binary.pth")
             print(f"  -> New best model saved with val loss: {best_val_loss:.4f}")
 
         save_loss_plot(train_losses, val_losses, config.VISUALIZATION_DIR / "loss_curve.png")
+        save_metrics_plot(train_metrics_history, val_metrics_history, config.VISUALIZATION_DIR / "metrics_curve.png")
         create_inference_visualization(model, train_dataset, device, config.VISUALIZATION_DIR, epoch=epoch + 1, num_samples=10, split_name='train')
         create_inference_visualization(model, val_dataset, device, config.VISUALIZATION_DIR, epoch=epoch + 1, num_samples=10, split_name='val')
         create_inference_visualization(model, test_dataset, device, config.VISUALIZATION_DIR, epoch=epoch + 1, num_samples=10, split_name='test')
@@ -219,7 +218,7 @@ def main():
     geometric_transforms = transforms.Compose([
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(degrees=(-45,45)),
+        #transforms.RandomRotation(degrees=(-45,45)),
     ])
 
     print("Loading datasets...")
@@ -237,7 +236,9 @@ def main():
         print("Error: Training dataset is empty. Exiting."); return
 
     print(f"Initializing model with {train_dataset.num_input_channels} input channels.")
-    model = SimpleUNet(in_channels=train_dataset.num_input_channels, out_channels=1).to(config.DEVICE)
+    #model = Model(in_channels=train_dataset.num_input_channels, out_channels=1).to(config.DEVICE)
+    # UNetPlusPlus:
+    model = Model(in_channels=train_dataset.num_input_channels, out_channels=1).to(config.DEVICE)
     criterion = MaskedBCELoss()
     optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
 
