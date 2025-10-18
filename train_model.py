@@ -3,6 +3,8 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import h5py
 from tqdm import tqdm
+from datetime import datetime
+import pandas as pd
 
 import torch
 import torch.nn as nn
@@ -19,7 +21,7 @@ from utils import apply_style_image, calculate_metrics, save_metrics_plot
 
 from unetplusplus import Model
 
-# --- Dataset Class (Unchanged from previous correct version) ---
+# --- Dataset Class (Unchanged) ---
 class PreprocessedBinaryVegDataset(Dataset):
     def __init__(self, data_dir: Path, style_dir: Path, use_fda: bool = False, photometric_augs=None, geometric_augs=None):
         self.data_dir = data_dir
@@ -74,12 +76,11 @@ class PreprocessedBinaryVegDataset(Dataset):
                 augmented = self.geometric_augs(stacked)
                 image, target, mask, style_image = torch.split(augmented, [self.num_input_channels, 1, 1, self.num_input_channels], dim=0)
 
-            #return {'image': image.float(), 'target': target.float(), 'mask': mask.float(), 'style_image': style_image.float()}
-            return {'image': image.float(), 'target': target.float(), 'mask': mask.float(), 'style_image': style_image.float()} # NORMALIZED IMAGE
+            return {'image': image.float(), 'target': target.float(), 'mask': mask.float(), 'style_image': style_image.float()}
         except Exception as e:
             print(f"Error loading HDF5 file for basename {basename}: {e}"); raise
 
-# --- Masked Loss Function ---
+# --- Masked Loss Function (Unchanged) ---
 class MaskedBCELoss(nn.Module):
     def __init__(self):
         super().__init__(); self.criterion = nn.BCEWithLogitsLoss(reduction='none')
@@ -88,22 +89,35 @@ class MaskedBCELoss(nn.Module):
         num_valid_pixels = mask.sum().clamp(min=1)
         return masked_loss.sum() / num_valid_pixels
 
-# --- Training Loop ---
+# --- Training Loop (MODIFIED) ---
 def train_model(model, train_dataset, val_dataset, test_dataset, criterion, optimizer, num_epochs, device):
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
     print(f"--- Starting training on {device} ---")
 
+    # --- NEW: Create filename and prepare for CSV logging ---
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Create a string from key config settings for the filename
+    config_str = (
+        f"LR_{config.LEARNING_RATE}_BS_{config.BATCH_SIZE}_EPOCHS_{config.NUM_EPOCHS}"
+        f"_DS_{config.DEEP_SUPERVISION}_ILW_{config.INVARIANCE_LOSS_WEIGHT}"
+    )
+    csv_filename = f"validation_scores_{timestamp}_{config_str}.csv"
+    csv_filepath = config.VISUALIZATION_DIR / csv_filename
+    validation_log = [] # List to store dicts of epoch results
+
+    print(f"Validation scores will be saved to: {csv_filepath}")
+    # --- END NEW ---
+
     best_val_loss = float('inf')
-    best_val_f1 = 0.0 # not yet used, but could be used to save best model below
     train_losses, val_losses = [], []
-    train_metrics_history, val_metrics_history = [], [] # Added lists for metrics
+    train_metrics_history, val_metrics_history = [], []
     invariance_criterion = nn.MSELoss()
 
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        train_tp, train_fp, train_fn = 0, 0, 0 # Added metric counters for training
+        train_tp, train_fp, train_fn = 0, 0, 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
 
         for batch in pbar:
@@ -113,7 +127,6 @@ def train_model(model, train_dataset, val_dataset, test_dataset, criterion, opti
             inputs_augmented = torch.clamp(inputs + style_images, 0, 255)
             optimizer.zero_grad()
 
-            # During training, model returns two values
             logits_clean1, logits_clean2, logits_clean3, final_logits_clean, features_clean = model(inputs)
             _, _, _, _, features_aug = model(inputs_augmented)
 
@@ -121,12 +134,11 @@ def train_model(model, train_dataset, val_dataset, test_dataset, criterion, opti
                 loss1 = criterion(logits_clean1, targets, masks)
                 loss2 = criterion(logits_clean2, targets, masks)
                 loss3 = criterion(logits_clean3, targets, masks)
-                loss4 = criterion(final_logits_clean, targets, masks) # The main output
-
-                # Combine the losses
+                loss4 = criterion(final_logits_clean, targets, masks)
                 segmentation_loss = loss1 + loss2 + loss3 + loss4
             else:
                 segmentation_loss = criterion(final_logits_clean, targets, masks)
+
             invariance_loss = invariance_criterion(features_clean, features_aug)
             total_loss = segmentation_loss + (config.INVARIANCE_LOSS_WEIGHT * invariance_loss)
 
@@ -137,16 +149,11 @@ def train_model(model, train_dataset, val_dataset, test_dataset, criterion, opti
             else:
                 print('loss is inf!')
 
-            # Calculate and accumulate training metrics for the batch
             preds = torch.sigmoid(final_logits_clean) > 0.5
             tp, fp, fn = calculate_metrics(preds, targets, masks)
-            train_tp += tp.item()
-            train_fp += fp.item()
-            train_fn += fn.item()
+            train_tp += tp.item(); train_fp += fp.item(); train_fn += fn.item()
 
         avg_train_loss = running_loss / len(train_loader)
-
-        # Calculate and store epoch-level training metrics
         train_precision = train_tp / (train_tp + train_fp + 1e-6)
         train_recall = train_tp / (train_tp + train_fn + 1e-6)
         train_f1 = 2 * (train_precision * train_recall) / (train_precision + train_recall + 1e-6)
@@ -155,41 +162,41 @@ def train_model(model, train_dataset, val_dataset, test_dataset, criterion, opti
 
         model.eval()
         val_loss = 0.0
-        val_tp, val_fp, val_fn = 0, 0, 0 # Added metric counters for validation
+        val_tp, val_fp, val_fn = 0, 0, 0
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
-                inputs, targets, masks, _ = batch['image'].to(device), batch['target'].to(device), batch['mask'].to(device), batch['style_image']
-
-                # --- THIS IS THE FIX ---
-                # During eval, model only returns one value
+                inputs, targets, masks = batch['image'].to(device), batch['target'].to(device), batch['mask'].to(device)
                 _, _, _, logits, _ = model(inputs)
                 loss = criterion(logits, targets, masks)
                 val_loss += loss.item()
-
-                # Calculate and accumulate validation metrics for the batch
                 preds = torch.sigmoid(logits) > 0.5
                 tp, fp, fn = calculate_metrics(preds, targets, masks)
-                val_tp += tp.item()
-                val_fp += fp.item()
-                val_fn += fn.item()
+                val_tp += tp.item(); val_fp += fp.item(); val_fn += fn.item()
 
         avg_val_loss = val_loss / len(val_loader)
-        # Calculate and store epoch-level validation metrics
         val_precision = val_tp / (val_tp + val_fp + 1e-6)
         val_recall = val_tp / (val_tp + val_fn + 1e-6)
         val_f1 = 2 * (val_precision * val_recall) / (val_precision + val_recall + 1e-6)
         val_losses.append(avg_val_loss)
         val_metrics_history.append({'precision': val_precision, 'recall': val_recall, 'f1': val_f1})
-        # Updated print statement to include F1 score
         print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val F1: {val_f1:.4f}")
 
+        # --- NEW: Log results for this epoch and save to CSV ---
+        epoch_log = {
+            'epoch': epoch + 1,
+            'train_loss': avg_train_loss,
+            'val_loss': avg_val_loss,
+            'val_precision': val_precision,
+            'val_recall': val_recall,
+            'val_f1': val_f1
+        }
+        validation_log.append(epoch_log)
 
-        # Best model is now saved based on F1 score
-        #if val_f1 > best_val_f1:
-        #    best_val_f1 = val_f1
-        #    torch.save(model.state_dict(), config.CHECKPOINT_DIR / "best_model_binary.pth")
-        #    print(f"  -> New best model saved with val F1: {best_val_f1:.4f}")
-        
+        # Convert to DataFrame and save, overwriting the file each time
+        log_df = pd.DataFrame(validation_log)
+        log_df.to_csv(csv_filepath, index=False)
+        # --- END NEW ---
+
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), config.CHECKPOINT_DIR / "best_model_binary.pth")
@@ -203,6 +210,7 @@ def train_model(model, train_dataset, val_dataset, test_dataset, criterion, opti
 
     print("--- Training finished. ---")
 
+# --- Main function (Unchanged) ---
 def main():
     set_seed(config.GLOBAL_RANDOM_SEED)
     config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -214,7 +222,6 @@ def main():
     geometric_transforms = transforms.Compose([
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
-        #transforms.RandomRotation(degrees=(-45,45)),
     ])
 
     print("Loading datasets...")
@@ -232,8 +239,6 @@ def main():
         print("Error: Training dataset is empty. Exiting."); return
 
     print(f"Initializing model with {train_dataset.num_input_channels} input channels.")
-    #model = Model(in_channels=train_dataset.num_input_channels, out_channels=1).to(config.DEVICE)
-    # UNetPlusPlus:
     model = Model(in_channels=train_dataset.num_input_channels, out_channels=1).to(config.DEVICE)
     criterion = MaskedBCELoss()
     optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
