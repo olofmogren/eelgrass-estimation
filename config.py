@@ -23,13 +23,29 @@ PATCH_HEIGHT_PIXELS = 512
 NUM_PATCHES_PER_ANNOTATION = 5
 ANNOTATION_RADIUS = 60
 
+
+# --- HYPERPARAMETER SEARCH CONFIGURATION ---
+
+# Number of random combinations to try
+NUM_SEARCH_TRIALS = 20
+
+# Define the search space.
+# For each hyperparameter, provide a list of values to choose from.
+HPARAM_SEARCH_SPACE = {
+    "learning_rate": [5e-4, 1e-4, 5e-5],
+    #"learning_rate": [1e-3, 5e-4, 1e-4, 5e-5],
+    "batch_size": [4, 8],
+    "deep_supervision": [True, False],
+    "invariance_loss_weight": [0.01, 0.1, 0.2, 0.4],
+    # You can add other parameters here, like optimizer type, etc.
+    # "optimizer": ["adam", "sgd"]
+}
+
 # --- Training Hyperparameters ---
-BATCH_SIZE = 4
+
 NUM_EPOCHS = 200
-LEARNING_RATE = 1e-4
 # RENAMED: Probability of applying the FDA augmentation
 STYLE_IMAGE_AUGMENTATION_PROBABILITY = 0.1
-INVARIANCE_LOSS_WEIGHT = 0.01
 
 # --- System and Reproducibility ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
