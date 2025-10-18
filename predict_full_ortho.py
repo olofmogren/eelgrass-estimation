@@ -35,9 +35,7 @@ def check_roi_overlap(tif_path: Path, roi_poly_wgs84: Polygon) -> bool:
     try:
         with rasterio.open(tif_path) as src:
             raster_bounds_poly = box(*src.bounds)
-            # Create a transformer from WGS84 to the raster's CRS to compare geometries
             transformer = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
-            # Transform the ROI polygon to the raster's CRS
             transformed_roi_poly = Polygon([transformer.transform(x, y) for x, y in roi_poly_wgs84.exterior.coords])
             return raster_bounds_poly.intersects(transformed_roi_poly)
     except Exception as e:
@@ -59,7 +57,7 @@ def update_combined_bounds(current_bounds, new_bounds):
 
     return (min_x, min_y, max_x, max_y)
 
-# --- CORE SCRIPT (with modifications) ---
+# --- CORE SCRIPT ---
 
 class SlidingWindowDataset(Dataset):
     """Dataset to create overlapping patches from a large orthomosaic for inference."""
@@ -70,10 +68,8 @@ class SlidingWindowDataset(Dataset):
         with rasterio.open(self.raster_path) as src:
             self.height = src.height
             self.width = src.width
-        # Adjust patch counts to ensure full coverage
-        self.x_patches = max(1, (self.width - self.patch_size + self.stride -1) // self.stride + 1)
-        self.y_patches = max(1, (self.height - self.patch_size + self.stride -1) // self.stride + 1)
-
+        self.x_patches = max(1, (self.width - self.patch_size + self.stride - 1) // self.stride + 1)
+        self.y_patches = max(1, (self.height - self.patch_size + self.stride - 1) // self.stride + 1)
 
     def __len__(self):
         return self.x_patches * self.y_patches
@@ -83,7 +79,6 @@ class SlidingWindowDataset(Dataset):
         y_off, x_off = row * self.stride, col * self.stride
         with rasterio.open(self.raster_path) as src:
             window = Window(x_off, y_off, self.patch_size, self.patch_size)
-            # Use boundless=True to handle edges gracefully
             patch = src.read(window=window, boundless=True, fill_value=0)
         patch_tensor = torch.from_numpy(patch).float() / 255.0
         return {'image': patch_tensor, 'x': x_off, 'y': y_off}
@@ -94,8 +89,6 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
     Main function to run prediction and visualization for a single orthomosaic.
     The plot extent is now controlled by `combined_bounds`.
     """
-    print(f"\n--- Processing {ortho_path.name} ---")
-
     patch_size = config.PATCH_WIDTH_PIXELS
     stride = patch_size // 2
     dataset = SlidingWindowDataset(ortho_path, patch_size, stride)
@@ -106,9 +99,8 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
         ortho_crs = src.crs
 
     full_prediction_mask = np.zeros((ortho_height, ortho_width), dtype=np.float32)
-    weight_mask = np.zeros_like(full_prediction_mask, dtype=np.float32) # Use float for weights
+    weight_mask = np.zeros_like(full_prediction_mask, dtype=np.float32)
 
-    # Create a tapering window for smooth blending (e.g., Hann window)
     window_taper = np.outer(np.hanning(patch_size), np.hanning(patch_size))
 
     with torch.no_grad():
@@ -127,16 +119,13 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
                 h, w = pred_patch.shape
                 y_end, x_end = min(y + h, ortho_height), min(x + w, ortho_width)
 
-                # Add tapered prediction to the main mask
                 full_prediction_mask[y:y_end, x:x_end] += pred_patch[:y_end-y, :x_end-x] * window_taper[:y_end-y, :x_end-x]
                 weight_mask[y:y_end, x:x_end] += window_taper[:y_end-y, :x_end-x]
 
-    # Avoid division by zero
     weight_mask[weight_mask == 0] = 1e-6
     averaged_prediction_mask = full_prediction_mask / weight_mask
     binary_prediction_mask = (averaged_prediction_mask > 0.5).astype(np.uint8)
 
-    # Load annotations
     veg_points, non_veg_points = [], []
     if annotations_path and annotations_path.exists():
         df = pd.read_excel(annotations_path, engine='openpyxl')
@@ -150,7 +139,6 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
             if total_veg.iloc[idx] >= 40: veg_points.append(point)
             else: non_veg_points.append(point)
 
-    # --- VISUALIZATION ---
     print("Creating visualization...")
     fig, ax = plt.subplots(figsize=(20, 20))
 
@@ -168,7 +156,6 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
     if veg_points:
         x, y = zip(*veg_points); ax.scatter(x, y, c='darkred', s=50, edgecolors='black', label='Annotation (Veg)')
 
-    # 5. MODIFIED: Apply COMBINED bounds to the plot
     if combined_bounds:
         minx, miny, maxx, maxy = combined_bounds
         ax.set_xlim(minx, maxx)
@@ -209,7 +196,6 @@ def main():
     model.load_state_dict(torch.load(args.model_path, map_location=device))
     model.eval()
 
-    # --- NEW: Filter TIFFs and calculate combined bounds BEFORE processing ---
     try:
         roi_poly = load_roi_polygon_wgs84(args.roi_path)
         print(f"Successfully loaded ROI from {args.roi_path}")
@@ -241,8 +227,12 @@ def main():
     print(f"\nProceeding to process {len(tiffs_to_process)} overlapping orthomosaics.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Process only the filtered TIFFs ---
-    for ortho_path in tiffs_to_process:
+    # --- Process only the filtered TIFFs with progress counter ---
+    num_to_process = len(tiffs_to_process)
+    for i, ortho_path in enumerate(tiffs_to_process):
+        # *** THIS IS THE NEWLY ADDED PRINTOUT ***
+        print(f"\n--- Processing file {i+1} of {num_to_process}: {ortho_path.name} ---")
+
         output_path = args.output_dir / (ortho_path.stem + "_prediction.png")
         predict_and_visualize(
             model=model,
@@ -251,7 +241,7 @@ def main():
             output_path=output_path,
             annotations_path=args.annotations_path,
             batch_size=args.batch_size,
-            combined_bounds=combined_bounds, # Pass the combined bounds for plotting
+            combined_bounds=combined_bounds,
             land_shp_path=args.land_shp_path
         )
 
