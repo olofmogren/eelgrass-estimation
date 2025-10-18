@@ -15,7 +15,7 @@ import numpy as np
 # Import from our config and utils files
 import config
 from utils import create_inference_visualization, set_seed, save_loss_plot
-from utils import apply_fda, calculate_metrics, save_metrics_plot
+from utils import apply_style_image, calculate_metrics, save_metrics_plot
 
 from unetplusplus import Model
 
@@ -61,14 +61,10 @@ class PreprocessedBinaryVegDataset(Dataset):
 
             style_image = torch.zeros_like(image)
 
-            if self.use_fda and self.style_paths and random.random() < 0.5:
+            if self.use_fda and self.style_paths and random.random() < config.STYLE_IMAGE_AUGMENTATION_PROBABILITY:
                 with h5py.File(random.choice(self.style_paths), "r") as hf:
                     style_image = torch.from_numpy(hf["style_image"][:])
-                image = apply_fda(image.byte(), style_image.byte(), beta=0.05)
-
-            if self.use_fda and self.style_paths and random.random() < config.FDA_AUGMENTATION_PROBABILITY:
-                with h5py.File(random.choice(self.style_paths), "r") as hf:
-                    style_image = torch.from_numpy(hf["style_image"][:])
+                image = apply_style_image(image.byte(), style_image.byte(), beta=0.05)
 
             if self.photometric_augs:
                 image = self.photometric_augs(image.byte())

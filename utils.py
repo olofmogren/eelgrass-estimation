@@ -33,6 +33,28 @@ def save_loss_plot(train_losses: list, val_losses: list, output_path: Path):
     plt.savefig(output_path)
     plt.close()
 
+def apply_style_image(source_img: torch.Tensor, target_img: torch.Tensor, beta: float = 0.1):
+    """
+    Applies Fourier Domain Adaptation, transferring the 'style' of the target
+    image to the 'content' of the source image.
+    """
+    source_img = source_img.float()
+    target_img = target_img.float()
+    
+    is_3d = len(source_img.shape) == 3
+    if is_3d:
+        source_img = source_img.unsqueeze(0)
+        target_img = target_img.unsqueeze(0)
+
+    augmented_image = source_img+target_img
+
+    if is_3d:
+        augmented_image = augmented_image.squeeze(0)
+    
+    augmented_image = torch.clamp(augmented_image, 0, 255)
+    
+    return augmented_image
+
 def apply_fda(source_img: torch.Tensor, target_img: torch.Tensor, beta: float = 0.1):
     """
     Applies Fourier Domain Adaptation, transferring the 'style' of the target

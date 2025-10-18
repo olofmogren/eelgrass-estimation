@@ -13,3 +13,5 @@ torch
 torchvision
 matplotlib
 openpyxl
+scipy
+
