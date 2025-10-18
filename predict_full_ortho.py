@@ -57,31 +57,61 @@ def update_combined_bounds(current_bounds, new_bounds):
 
     return (min_x, min_y, max_x, max_y)
 
-# --- CORE SCRIPT ---
-
 class SlidingWindowDataset(Dataset):
-    """Dataset to create overlapping patches from a large orthomosaic for inference."""
+    """Dataset with OPTIMIZED file handling for inference."""
     def __init__(self, raster_path: Path, patch_size: int, stride: int):
-        self.raster_path = raster_path
+        self.raster_path = raster_path # Store path, not file handle
         self.patch_size = patch_size
         self.stride = stride
+
+        # Open once to get dimensions
         with rasterio.open(self.raster_path) as src:
             self.height = src.height
             self.width = src.width
+
         self.x_patches = max(1, (self.width - self.patch_size + self.stride - 1) // self.stride + 1)
         self.y_patches = max(1, (self.height - self.patch_size + self.stride - 1) // self.stride + 1)
+
+        # This will hold the file object for each worker process
+        self.src = None
 
     def __len__(self):
         return self.x_patches * self.y_patches
 
     def __getitem__(self, idx):
-        row, col = (idx // self.x_patches), (idx % self.x_patches)
-        y_off, x_off = row * self.stride, col * self.stride
-        with rasterio.open(self.raster_path) as src:
+        # Each worker process will open the file once and store the handle in self.src
+        if self.src is None:
+            self.src = rasterio.open(self.raster_path)
+
+        try:
+            row, col = (idx // self.x_patches), (idx % self.x_patches)
+            y_off, x_off = row * self.stride, col * self.stride
+
             window = Window(x_off, y_off, self.patch_size, self.patch_size)
-            patch = src.read(window=window, boundless=True, fill_value=0)
-        patch_tensor = torch.from_numpy(patch).float() / 255.0
-        return {'image': patch_tensor, 'x': x_off, 'y': y_off}
+            patch = self.src.read(window=window, boundless=True, fill_value=0)
+
+            patch_tensor = torch.from_numpy(patch).float() / 255.0
+            return {'image': patch_tensor, 'x': x_off, 'y': y_off}
+
+        except rasterio.errors.RasterioIOError as e:
+            print(f"\nWARNING: Skipping corrupt patch in {self.raster_path.name} at index {idx}. Error: {e}")
+            return None
+
+def collate_fn_skip_corrupt(batch):
+    """
+    A custom collate_fn that filters out None values from a batch.
+    These None values are returned by __getitem__ when a patch is corrupt.
+    """
+    # Filter out all the None values
+    batch = [item for item in batch if item is not None]
+
+    # If the whole batch was corrupt, return an empty dictionary or handle as needed
+    if not batch:
+        return {} # Return an empty dict that the loop can check for
+
+    # If there are valid items, proceed with default collation
+    return torch.utils.data.dataloader.default_collate(batch)
+
 
 
 def predict_and_visualize(model, device, ortho_path, output_path, annotations_path, batch_size, combined_bounds, land_shp_path):
@@ -90,9 +120,11 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
     The plot extent is now controlled by `combined_bounds`.
     """
     patch_size = config.PATCH_WIDTH_PIXELS
-    stride = patch_size // 2
+    stride = int(patch_size * 0.75)
     dataset = SlidingWindowDataset(ortho_path, patch_size, stride)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    #dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, collate_fn=collate_fn_skip_corrupt)
 
     with rasterio.open(ortho_path) as src:
         ortho_height, ortho_width = src.height, src.width
@@ -103,8 +135,11 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
 
     window_taper = np.outer(np.hanning(patch_size), np.hanning(patch_size))
 
-    with torch.no_grad():
+    #with torch.no_grad():
+    with torch.inference_mode():
         for batch in tqdm(dataloader, desc=f"Predicting on {ortho_path.name}"):
+            if not batch:
+                continue
             images = batch['image'].to(device)
             if images.shape[1] > 3: images = images[:, :3, :, :]
             x_coords, y_coords = batch['x'], batch['y']
@@ -185,7 +220,7 @@ def main():
     parser.add_argument('--roi-path', type=Path, required=True, help="Path to the roi.txt file to filter TIFFs and define visualization bounds.")
     parser.add_argument('--annotations-path', type=Path, default=None, help="(Optional) Path to a master Excel file with ground truth annotations.")
     parser.add_argument('--output-dir', type=Path, required=True, help="Path to the directory to save the output visualization PNG files.")
-    parser.add_argument('--batch-size', type=int, default=8, help="Batch size for inference.")
+    parser.add_argument('--batch-size', type=int, default=12, help="Batch size for inference.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
