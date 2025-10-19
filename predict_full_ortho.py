@@ -116,51 +116,61 @@ def collate_fn_skip_corrupt(batch):
 
 def predict_and_visualize(model, device, ortho_path, output_path, annotations_path, batch_size, combined_bounds, land_shp_path):
     """
-    Main function to run prediction and visualization for a single orthomosaic.
-    The plot extent is now controlled by `combined_bounds`.
+    Runs prediction by writing patches directly to a GeoTIFF file on disk,
+    then loads the saved GeoTIFF for visualization.
     """
-    patch_size = config.PATCH_WIDTH_PIXELS
-    stride = int(patch_size * 0.75)
-    dataset = SlidingWindowDataset(ortho_path, patch_size, stride)
-    #dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    print(f"\n--- Processing {ortho_path.name} ---")
 
+    patch_size = config.PATCH_WIDTH_PIXELS
+    # Using a stride equal to patch_size (or slightly less, e.g., 0.95)
+    # is the simplest way to predict to a file without complex read-modify-write logic.
+    stride = int(patch_size * 0.95) # Reduced overlap for speed, minimal for simple overwrite
+    dataset = SlidingWindowDataset(ortho_path, patch_size, stride)
+
+    # Using the custom collate_fn and increased workers for speed
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, collate_fn=collate_fn_skip_corrupt)
 
+    # Define paths for the temporary and final prediction files
+    temp_prediction_tif_path = output_path.with_suffix(".temp.tif")
+
     with rasterio.open(ortho_path) as src:
-        ortho_height, ortho_width = src.height, src.width
-        ortho_crs = src.crs
+        ortho_crs = src.crs # Store CRS for later use
 
-    full_prediction_mask = np.zeros((ortho_height, ortho_width), dtype=np.float32)
-    weight_mask = np.zeros_like(full_prediction_mask, dtype=np.float32)
+        # Define metadata for the output prediction TIFF
+        meta = src.meta.copy()
+        meta.update(driver='GTiff', count=1, dtype='uint8', compress='lzw', nodata=None)
 
-    window_taper = np.outer(np.hanning(patch_size), np.hanning(patch_size))
+        # --- PHASE 1: PREDICTION (Write to Disk) ---
+        with rasterio.open(temp_prediction_tif_path, 'w', **meta) as dst:
+            with torch.inference_mode():
+                for batch in tqdm(dataloader, desc=f"Predicting on {ortho_path.name}"):
+                    if not batch: continue # Skip corrupt/empty batches
 
-    #with torch.no_grad():
-    with torch.inference_mode():
-        for batch in tqdm(dataloader, desc=f"Predicting on {ortho_path.name}"):
-            if not batch:
-                continue
-            images = batch['image'].to(device)
-            if images.shape[1] > 3: images = images[:, :3, :, :]
-            x_coords, y_coords = batch['x'], batch['y']
+                    # Use autocast if your GPU supports it for an extra speed boost
+                    # with torch.cuda.amp.autocast():
+                    images = batch['image'].to(device)
+                    x_coords, y_coords = batch['x'], batch['y']
 
-            _, _, _, logits, _ = model(images)
+                    _, _, _, logits, _ = model(images)
+                    preds = (torch.sigmoid(logits) > 0.5).cpu().numpy().astype(np.uint8)
 
-            preds = torch.sigmoid(logits).cpu().numpy()
-            for i in range(preds.shape[0]):
-                y, x = y_coords[i].item(), x_coords[i].item()
-                pred_patch = preds[i, 0, :, :]
+                    for i in range(preds.shape[0]):
+                        y, x = y_coords[i].item(), x_coords[i].item()
+                        pred_patch = preds[i, :, :, :] # Shape (1, H, W)
 
-                h, w = pred_patch.shape
-                y_end, x_end = min(y + h, ortho_height), min(x + w, ortho_width)
+                        # Write the predicted patch directly to the correct window in the output file
+                        window = Window(x, y, pred_patch.shape[2], pred_patch.shape[1])
+                        dst.write(pred_patch, window=window)
 
-                full_prediction_mask[y:y_end, x:x_end] += pred_patch[:y_end-y, :x_end-x] * window_taper[:y_end-y, :x_end-x]
-                weight_mask[y:y_end, x:x_end] += window_taper[:y_end-y, :x_end-x]
+    # --- PHASE 2: VISUALIZATION ---
 
-    weight_mask[weight_mask == 0] = 1e-6
-    averaged_prediction_mask = full_prediction_mask / weight_mask
-    binary_prediction_mask = (averaged_prediction_mask > 0.5).astype(np.uint8)
+    # --- OLD MEMORY-HEAVY LOGIC REMOVED HERE ---
+    # weight_mask[weight_mask == 0] = 1e-6
+    # averaged_prediction_mask = full_prediction_mask / weight_mask
+    # binary_prediction_mask = (averaged_prediction_mask > 0.5).astype(np.uint8)
+    # -------------------------------------------
 
+    # Load annotations (unchanged)
     veg_points, non_veg_points = [], []
     if annotations_path and annotations_path.exists():
         df = pd.read_excel(annotations_path, engine='openpyxl')
@@ -182,9 +192,11 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
     land_gdf = geopandas.read_file(land_shp_path).to_crs(ortho_crs)
     land_gdf.plot(ax=ax, facecolor='white', edgecolor='black', linewidth=0.5)
 
-    with rasterio.open(ortho_path) as src:
+    # --- Use the saved prediction file for plotting ---
+    with rasterio.open(temp_prediction_tif_path) as pred_src:
         cmap_pred = ListedColormap([(0, 0, 0, 0), (1, 0.5, 0.5, 0.6)])
-        ax.imshow(binary_prediction_mask, cmap=cmap_pred, extent=rasterio.plot.plotting_extent(src))
+        # The prediction mask is read directly from disk here
+        ax.imshow(pred_src.read(1), cmap=cmap_pred, extent=rasterio.plot.plotting_extent(pred_src))
 
     if non_veg_points:
         x, y = zip(*non_veg_points); ax.scatter(x, y, c='white', s=50, edgecolors='black', label='Annotation (Non-Veg)')
@@ -209,6 +221,10 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
+
+    # Clean up the temporary file
+    temp_prediction_tif_path.unlink()
+
     print(f"Visualization saved to {output_path}")
 
 
