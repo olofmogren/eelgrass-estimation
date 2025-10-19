@@ -98,93 +98,100 @@ def apply_fda(source_img: torch.Tensor, target_img: torch.Tensor, beta: float = 
     
     return fda_img
 
-def create_inference_visualization(model, dataset: Dataset, device: torch.device, output_dir: Path, epoch: int, num_samples: int = 10, split_name: str = 'split'):
-    """
-    Generates and saves a single PNG file containing a grid of visualizations.
-    """
-    if not dataset or len(dataset) == 0:
-        print(f"Dataset for '{split_name}' is empty. Skipping visualization.")
+
+def create_inference_visualization(model, dataset, device, output_dir: Path, epoch: int, num_samples: int, split_name: str):
+    """Creates a grid visualization of model predictions on a few samples."""
+    if len(dataset) == 0:
         return
 
-    split_output_dir = output_dir / split_name
-    split_output_dir.mkdir(parents=True, exist_ok=True)
-    model.eval()
-    
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Adjust number of samples if dataset is smaller
     num_samples = min(num_samples, len(dataset))
-    if num_samples == 0: return
+    if num_samples == 0:
+        return
 
-    is_train = split_name == 'train'
-    num_cols = 5 if is_train else 4
-    fig_width = 20 if is_train else 16
-    fig, axes = plt.subplots(nrows=num_samples, ncols=num_cols, figsize=(fig_width, 4 * num_samples))
-    if num_samples == 1: axes = np.array([axes])
+    fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4 * num_samples))
 
-    loader = DataLoader(dataset, batch_size=1, shuffle=True)
+    # Set titles for the top row
+    if num_samples > 0:
+        axes[0, 0].set_title("Input Image (RGB)", fontsize=10)
+        axes[0, 1].set_title("Ground Truth", fontsize=10)
+        axes[0, 2].set_title("Model Prediction", fontsize=10)
+        axes[0, 3].set_title("Loss Mask", fontsize=10)
 
+    model.eval()
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(loader, total=num_samples, desc=f"Visualizing {split_name} samples for epoch {epoch}")):
-            if i >= num_samples: break
-            
-            inputs, targets, masks = batch['image'], batch['target'], batch['mask']
-            
-            # --- THIS IS THE FIX ---
-            # During eval, model only returns logits
-            _, _, _, outputs, _ = model(inputs.to(device))
-            preds = torch.sigmoid(outputs) > 0.5
+        for i in range(num_samples):
+            # Get a sample from the dataset
+            sample_idx = np.random.randint(0, len(dataset))
+            sample = dataset[sample_idx]
+            image, target, mask = sample['image'], sample['target'], sample['mask']
 
-            img_np = inputs[0].cpu().numpy()
-            target_np = targets[0, 0].cpu().numpy()
-            mask_np = masks[0, 0].cpu().numpy()
-            pred_np = preds[0, 0].cpu().numpy()
-            
-            input_pixel_sum = int(np.sum(img_np))
-            veg_pixel_count = int(np.sum(target_np))
+            # Prepare for model (add batch dimension)
+            input_tensor = image.unsqueeze(0).to(device)
 
-            img_rgb_to_display = np.transpose(img_np, (1, 2, 0)).astype(np.uint8)
+            # Get model prediction
+            _, _, _, logits, _ = model(input_tensor)
+            pred = torch.sigmoid(logits)
 
-            row_axes = axes[i]
+            # --- NEW: Calculate and display metrics for this specific sample ---
+            # Move tensors to CPU for metric calculation
+            pred_cpu = pred.squeeze(0).cpu()
+            target_cpu = target.cpu()
+            mask_cpu = mask.cpu()
 
-            row_axes[0].imshow(img_rgb_to_display, vmin=0, vmax=255)
-            row_axes[1].imshow(target_np, cmap='gray')
-            row_axes[2].imshow(pred_np, cmap='gray')
-            row_axes[3].imshow(mask_np, cmap='magma')
-            
-            row_axes[0].set_ylabel(f"Sample {i+1}", size='large')
-            
-            row_axes[0].text(5, 18, f"Sum: {input_pixel_sum}", 
-                             color='white', fontsize=10, 
-                             bbox=dict(facecolor='black', alpha=0.5, edgecolor='none', boxstyle='round,pad=0.2'))
-            row_axes[1].text(5, 18, f"Veg Pixels: {veg_pixel_count}", 
-                             color='white', fontsize=10, 
-                             bbox=dict(facecolor='black', alpha=0.5, edgecolor='none', boxstyle='round,pad=0.2'))
+            # Calculate metrics for this single image
+            tp, fp, fn = calculate_metrics(pred_cpu, target_cpu, mask_cpu)
+            tp, fp, fn = tp.item(), fp.item(), fn.item()
 
-            if is_train:
-                augmented_image_np = img_np
-                if hasattr(dataset, 'style_paths') and dataset.style_paths:
-                    with h5py.File(random.choice(dataset.style_paths), "r") as hf:
-                        style_image_np = hf["style_image"][:]
-                    
-                    augmented_image_tensor = apply_fda(torch.from_numpy(img_np), torch.from_numpy(style_image_np))
-                    augmented_image_np = augmented_image_tensor.numpy()
+            # Calculate P, R, F1, adding epsilon to avoid division by zero
+            precision = tp / (tp + fp + 1e-6)
+            recall = tp / (tp + fn + 1e-6)
+            f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
 
-                augmented_image_display = np.transpose(augmented_image_np, (1, 2, 0)).astype(np.uint8)
-                row_axes[4].imshow(augmented_image_display, vmin=0, vmax=255)
+            # Create the text string to display
+            metrics_text = f"P: {precision:.2f} | R: {recall:.2f} | F1: {f1:.2f}"
 
-            if i == 0:
-                row_axes[0].set_title("Input Image (RGB)")
-                row_axes[1].set_title("Ground Truth")
-                row_axes[2].set_title("Model Prediction")
-                row_axes[3].set_title("Loss Mask")
-                if is_train:
-                    row_axes[4].set_title("Input + FDA Style")
-            
-            for ax in row_axes:
-                ax.set_xticks([]); ax.set_yticks([])
+            # --- END NEW ---
 
-    fig.tight_layout(pad=1.5)
-    filename = f"epoch_{epoch:02d}_{split_name}_summary.png"
-    plt.savefig(split_output_dir / filename, dpi=120, bbox_inches='tight')
-    plt.close(fig)
+            # Convert to numpy for plotting
+            image_np = image.cpu().numpy().transpose(1, 2, 0)
+            image_np = np.clip(image_np / 255.0, 0, 1) # Normalize if not already
+            target_np = target.cpu().numpy().squeeze()
+            pred_np = pred.squeeze(0).cpu().numpy().squeeze()
+            mask_np = mask.cpu().numpy().squeeze()
+
+            # Plot Input Image
+            ax = axes[i, 0]
+            ax.imshow(image_np)
+            ax.set_ylabel(f"Sample {i+1}", rotation=90, size='large')
+            ax.set_xticks([]); ax.set_yticks([])
+            # Add the metrics text to the input image subplot
+            text_obj = ax.text(5, 20, metrics_text, fontsize=12, color='white', fontweight='bold')
+            text_obj.set_path_effects([patheffects.withStroke(linewidth=3, foreground='black')])
+
+
+            # Plot Ground Truth
+            ax = axes[i, 1]
+            ax.imshow(target_np, cmap='gray')
+            ax.set_xticks([]); ax.set_yticks([])
+
+            # Plot Model Prediction
+            ax = axes[i, 2]
+            ax.imshow(pred_np, cmap='gray', vmin=0, vmax=1)
+            ax.set_xticks([]); ax.set_yticks([])
+
+            # Plot Loss Mask (Prediction overlaid on mask)
+            ax = axes[i, 3]
+            loss_mask_viz = np.stack([pred_np, pred_np, np.zeros_like(pred_np)], axis=-1)
+            loss_mask_viz[mask_np == 0] = 0 # Black out areas outside the mask
+            ax.imshow(loss_mask_viz)
+            ax.set_xticks([]); ax.set_yticks([])
+
+    plt.tight_layout(pad=0.5)
+    plt.savefig(output_dir / f"{split_name}_epoch_{epoch:03d}.png", dpi=150)
+    plt.close()
 
 def calculate_metrics(preds: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor):
     """

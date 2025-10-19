@@ -90,6 +90,9 @@ class SlidingWindowDataset(Dataset):
             window = Window(x_off, y_off, self.patch_size, self.patch_size)
             patch = self.src.read(window=window, boundless=True, fill_value=0)
 
+            if patch.shape[0] > 3:
+                patch = patch[:3, :, :]
+
             patch_tensor = torch.from_numpy(patch).float() / 255.0
             return {'image': patch_tensor, 'x': x_off, 'y': y_off}
 
@@ -114,40 +117,38 @@ def collate_fn_skip_corrupt(batch):
 
 
 
+
 def predict_and_visualize(model, device, ortho_path, output_path, annotations_path, batch_size, combined_bounds, land_shp_path):
     """
     Runs prediction by writing patches directly to a GeoTIFF file on disk,
-    then loads the saved GeoTIFF for visualization.
+    then loads the saved GeoTIFF for visualization. This version is cleaned
+    of all legacy in-memory code.
     """
     print(f"\n--- Processing {ortho_path.name} ---")
 
     patch_size = config.PATCH_WIDTH_PIXELS
-    # Using a stride equal to patch_size (or slightly less, e.g., 0.95)
-    # is the simplest way to predict to a file without complex read-modify-write logic.
-    stride = int(patch_size * 0.95) # Reduced overlap for speed, minimal for simple overwrite
+    # Using a stride that overlaps slightly is a good balance for this method.
+    stride = int(patch_size * 0.95)
     dataset = SlidingWindowDataset(ortho_path, patch_size, stride)
 
-    # Using the custom collate_fn and increased workers for speed
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, collate_fn=collate_fn_skip_corrupt)
 
-    # Define paths for the temporary and final prediction files
     temp_prediction_tif_path = output_path.with_suffix(".temp.tif")
 
+    # Open the source file once at the top to get essential metadata
     with rasterio.open(ortho_path) as src:
-        ortho_crs = src.crs # Store CRS for later use
+        ortho_crs = src.crs
+        ortho_height, ortho_width = src.height, src.width
 
-        # Define metadata for the output prediction TIFF
         meta = src.meta.copy()
         meta.update(driver='GTiff', count=1, dtype='uint8', compress='lzw', nodata=None)
 
-        # --- PHASE 1: PREDICTION (Write to Disk) ---
+        # --- PHASE 1: PREDICTION (Write directly to disk) ---
         with rasterio.open(temp_prediction_tif_path, 'w', **meta) as dst:
             with torch.inference_mode():
                 for batch in tqdm(dataloader, desc=f"Predicting on {ortho_path.name}"):
-                    if not batch: continue # Skip corrupt/empty batches
+                    if not batch: continue
 
-                    # Use autocast if your GPU supports it for an extra speed boost
-                    # with torch.cuda.amp.autocast():
                     images = batch['image'].to(device)
                     x_coords, y_coords = batch['x'], batch['y']
 
@@ -156,26 +157,24 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
 
                     for i in range(preds.shape[0]):
                         y, x = y_coords[i].item(), x_coords[i].item()
-                        pred_patch = preds[i, :, :, :] # Shape (1, H, W)
+                        pred_patch = preds[i, :, :, :]
 
-                        # Write the predicted patch directly to the correct window in the output file
-                        window = Window(x, y, pred_patch.shape[2], pred_patch.shape[1])
-                        dst.write(pred_patch, window=window)
+                        # Handle edge cases by clipping the write window and data
+                        write_h = min(pred_patch.shape[1], ortho_height - y)
+                        write_w = min(pred_patch.shape[2], ortho_width - x)
+                        write_window = Window(x, y, write_w, write_h)
+                        data_to_write = pred_patch[:, :write_h, :write_w]
 
-    # --- PHASE 2: VISUALIZATION ---
+                        dst.write(data_to_write, window=write_window)
 
-    # --- OLD MEMORY-HEAVY LOGIC REMOVED HERE ---
-    # weight_mask[weight_mask == 0] = 1e-6
-    # averaged_prediction_mask = full_prediction_mask / weight_mask
-    # binary_prediction_mask = (averaged_prediction_mask > 0.5).astype(np.uint8)
-    # -------------------------------------------
+    # --- PHASE 2: VISUALIZATION (Read from the saved file) ---
 
-    # Load annotations (unchanged)
+    # Load annotations
     veg_points, non_veg_points = [], []
     if annotations_path and annotations_path.exists():
         df = pd.read_excel(annotations_path, engine='openpyxl')
         gdf = geopandas.GeoDataFrame(df, geometry=geopandas.points_from_xy(df.Longitud, df.Latitud), crs="EPSG:4326")
-        gdf = gdf.to_crs(ortho_crs)
+        gdf = gdf.to_crs(ortho_crs) # Use the ortho_crs defined earlier
         veg_cols = get_vegetation_columns(df)
         df[veg_cols] = df[veg_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
         total_veg = df[veg_cols].sum(axis=1)
@@ -186,23 +185,24 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
 
     print("Creating visualization...")
     fig, ax = plt.subplots(figsize=(20, 20))
-
     ax.set_facecolor('lightblue')
 
+    # Plot land shapefile
     land_gdf = geopandas.read_file(land_shp_path).to_crs(ortho_crs)
     land_gdf.plot(ax=ax, facecolor='white', edgecolor='black', linewidth=0.5)
 
-    # --- Use the saved prediction file for plotting ---
+    # Plot the prediction from the temporary file
     with rasterio.open(temp_prediction_tif_path) as pred_src:
         cmap_pred = ListedColormap([(0, 0, 0, 0), (1, 0.5, 0.5, 0.6)])
-        # The prediction mask is read directly from disk here
         ax.imshow(pred_src.read(1), cmap=cmap_pred, extent=rasterio.plot.plotting_extent(pred_src))
 
+    # Plot annotation points
     if non_veg_points:
         x, y = zip(*non_veg_points); ax.scatter(x, y, c='white', s=50, edgecolors='black', label='Annotation (Non-Veg)')
     if veg_points:
         x, y = zip(*veg_points); ax.scatter(x, y, c='darkred', s=50, edgecolors='black', label='Annotation (Veg)')
 
+    # Set plot boundaries and labels
     if combined_bounds:
         minx, miny, maxx, maxy = combined_bounds
         ax.set_xlim(minx, maxx)
@@ -219,10 +219,10 @@ def predict_and_visualize(model, device, ortho_path, output_path, annotations_pa
     ax.set_xlabel("Easting"); ax.set_ylabel("Northing")
     ax.tick_params(axis='x', rotation=45)
     plt.tight_layout()
+
+    # Save the final visualization and clean up
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
-
-    # Clean up the temporary file
     temp_prediction_tif_path.unlink()
 
     print(f"Visualization saved to {output_path}")
