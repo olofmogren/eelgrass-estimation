@@ -1,3 +1,5 @@
+# preprocess_data.py
+
 import os
 import glob
 import random
@@ -19,7 +21,7 @@ from scipy.ndimage import gaussian_filter
 # Import from config
 import config
 
-# --- (Functions from get_vegetation_columns to process_geotiff_and_annotations remain unchanged) ---
+# --- (Functions from get_vegetation_columns to extract_style_patches remain unchanged) ---
 
 def get_vegetation_columns(df: pd.DataFrame) -> list:
     """Identifies the correct vegetation column names from the dataframe."""
@@ -92,7 +94,6 @@ def extract_style_patches(train_dir: Path, style_dir: Path, grayscale: bool = Fa
         print("Warning: No training patches found. Cannot generate style images.")
         return
 
-    # Select a random subset of patches to process
     num_to_process = min(num_styles, len(train_patch_paths))
     selected_patches = random.sample(train_patch_paths, num_to_process)
     print(f"Randomly selected {num_to_process} training patches to generate style images.")
@@ -107,22 +108,15 @@ def extract_style_patches(train_dir: Path, style_dir: Path, grayscale: bool = Fa
         with h5py.File(patch_path, 'r') as hf:
             original_image = hf['image'][:]
 
-        if original_image.shape[0] < 3: continue # Ensure it's a 3-channel image
+        if original_image.shape[0] < 3: continue
 
-        # Apply low-pass filter to get the blurred version
         low_freq = gaussian_filter(original_image, sigma=[0, sigma, sigma])
-
-        # Subtract low-frequency from original to get high-frequency content
         high_freq = original_image - low_freq
-
         style_image = high_freq
         if grayscale:
-            # Calculate grayscale by averaging the channels
             gray_channel = np.mean(style_image, axis=0, keepdims=True)
-            # Repeat the gray channel 3 times to get a (3, H, W) image
             style_image = np.repeat(gray_channel, 3, axis=0)
 
-        # Save the resulting style image
         with h5py.File(style_dir / f"style_{i:05d}.h5", "w") as hf_out:
             hf_out.create_dataset("style_image", data=style_image)
 
@@ -130,7 +124,7 @@ def extract_style_patches(train_dir: Path, style_dir: Path, grayscale: bool = Fa
 
 
 def process_geotiff_and_annotations(tif_path: Path, master_annotations_gdf: geopandas.GeoDataFrame, roi_polygon_wgs84: Polygon, output_dir: Path):
-    """Processes a GeoTIFF by generating patches with circular annotations of a specified radius."""
+    """Processes a GeoTIFF by generating patches with single-pixel annotations."""
     total_patches_generated_for_file = 0
     total_discarded_for_file = 0
     try:
@@ -176,14 +170,11 @@ def process_geotiff_and_annotations(tif_path: Path, master_annotations_gdf: geop
                             rel_row, rel_col = abs_row - top, abs_col - left
                             if not (0 <= rel_row < h and 0 <= rel_col < w): continue
 
-                            # Create circular annotation
-                            Y, X = np.ogrid[:h, :w]
-                            dist_from_center = np.sqrt((X - rel_col)**2 + (Y - rel_row)**2)
-                            circle_mask = dist_from_center <= config.ANNOTATION_RADIUS
-
-                            mask_binary[circle_mask] = 1
+                            # Store only the exact annotated pixel, ignoring config.ANNOTATION_RADIUS
+                            mask_binary[rel_row, rel_col] = 1
                             if ann_in_patch[veg_cols].sum() >= 40:
-                                target_binary[circle_mask] = 1
+                                target_binary[rel_row, rel_col] = 1
+
                         except Exception: continue
                     total_patches_generated_for_file += 1
                     base_name = f"{tif_path.stem}_patch_{ann_idx}_{i}"
@@ -333,4 +324,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

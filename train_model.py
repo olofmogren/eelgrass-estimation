@@ -1,3 +1,5 @@
+# train_model.py
+
 import random
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -24,11 +26,12 @@ from utils import apply_style_image, calculate_metrics, save_metrics_plot
 
 from unetplusplus import Model
 
-# --- Dataset Class and MaskedBCELoss (Unchanged from your version) ---
+# --- Dataset Class and MaskedBCELoss ---
 class PreprocessedBinaryVegDataset(Dataset):
-    def __init__(self, data_dir: Path, style_dir: Path, use_fda: bool = False, photometric_augs=None, geometric_augs=None):
+    def __init__(self, data_dir: Path, style_dir: Path, is_train: bool = False, use_fda: bool = False, photometric_augs=None, geometric_augs=None):
         self.data_dir = data_dir
         self.style_dir = style_dir
+        self.is_train = is_train  # <-- NEW: Flag to indicate training mode
         self.use_fda = use_fda
         self.photometric_augs = photometric_augs
         self.geometric_augs = geometric_augs
@@ -58,16 +61,58 @@ class PreprocessedBinaryVegDataset(Dataset):
             with h5py.File(self.data_dir / f"{basename}_source.h5", "r") as hf: image = torch.from_numpy(hf["image"][:])
             with h5py.File(self.data_dir / f"{basename}_target_binary.h5", "r") as hf: target = torch.from_numpy(hf["target"][:]).unsqueeze(0)
             with h5py.File(self.data_dir / f"{basename}_mask_binary.h5", "r") as hf: mask = torch.from_numpy(hf["mask"][:]).unsqueeze(0)
+
+            # If this is the training dataset, dynamically create circular annotations
+            # from the single-pixel ground truths.
+            if self.is_train and config.ANNOTATION_RADIUS > 0:
+                h, w = target.shape[1], target.shape[2]
+                
+                # Find all annotated single-pixel locations from the original mask
+                annotated_points = torch.nonzero(mask, as_tuple=False)
+
+                if annotated_points.shape[0] > 0: # Check if there are any annotations
+                    y_coords, x_coords = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
+                    
+                    # Create new empty masks to fill with circles
+                    new_target = torch.zeros_like(target, dtype=torch.bool)
+                    new_mask = torch.zeros_like(mask, dtype=torch.bool)
+
+                    for point in annotated_points:
+                        # point is formatted as [channel_idx, row, col]
+                        _, r, c = point
+                        
+                        dist_from_center = torch.sqrt((y_coords - r)**2 + (x_coords - c)**2)
+                        circle_mask_2d = dist_from_center <= config.ANNOTATION_RADIUS
+                        
+                        # Add the channel dimension for broadcasting
+                        circle_mask_3d = circle_mask_2d.unsqueeze(0) 
+                        
+                        # Use logical OR to add the new circle to the mask
+                        new_mask |= circle_mask_3d
+                        
+                        # Only add a circle to the target if the original pixel was a positive class
+                        if target[0, r, c] == 1:
+                            new_target |= circle_mask_3d
+                    
+                    # Replace the original single-pixel masks with the new circular ones
+                    target = new_target
+                    mask = new_mask
+            
             style_image = torch.zeros_like(image)
             if self.use_fda and self.style_paths and random.random() < config.STYLE_IMAGE_AUGMENTATION_PROBABILITY:
                 with h5py.File(random.choice(self.style_paths), "r") as hf: style_image = torch.from_numpy(hf["style_image"][:])
                 image = apply_style_image(image.byte(), style_image.byte(), beta=0.05)
+            
             if self.photometric_augs: image = self.photometric_augs(image.byte())
+            
             if self.geometric_augs:
-                stacked = torch.cat((image, target, mask, style_image), dim=0)
+                # Note: Convert boolean masks to float for augmentation, then back to bool/float
+                stacked = torch.cat((image, target.float(), mask.float(), style_image), dim=0)
                 augmented = self.geometric_augs(stacked)
                 image, target, mask, style_image = torch.split(augmented, [self.num_input_channels, 1, 1, self.num_input_channels], dim=0)
+                
             return {'image': image.float(), 'target': target.float(), 'mask': mask.float(), 'style_image': style_image.float()}
+        
         except Exception as e:
             print(f"Error loading HDF5 file for basename {basename}: {e}", file=sys.stderr); raise
 
@@ -79,14 +124,14 @@ class MaskedBCELoss(nn.Module):
         num_valid_pixels = mask.sum().clamp(min=1)
         return masked_loss.sum() / num_valid_pixels
 
-# --- Training Loop ---
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, deep_supervision, inv_loss_weight, model_save_path, results_csv_path):
+def train_model(model, train_dataset, val_dataset, criterion, optimizer, num_epochs, device, deep_supervision, inv_loss_weight, model_save_path, results_csv_path, batch_size):
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
-    # --- Track the best metrics across all epochs ---
     best_val_f1 = -1.0
     best_val_metrics = {'recall': 0.0, 'precision': 0.0, 'f1': 0.0}
-
-    # --- List to store detailed epoch-by-epoch logs ---
+    train_losses, val_losses = [], []
+    train_metrics_history, val_metrics_history = [], []
     epoch_log_history = []
 
     invariance_criterion = nn.MSELoss()
@@ -94,10 +139,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        # Use stderr for tqdm to keep stdout clean for the final JSON result
+        train_tp, train_fp, train_fn = 0, 0, 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", file=sys.stderr, dynamic_ncols=True)
         for batch in pbar:
-            # Training step... (logic is unchanged)
             inputs, targets, masks, style_images = \
                 batch['image'].to(device), batch['target'].to(device), batch['mask'].to(device), batch['style_image'].to(device)
             inputs_augmented = torch.clamp(inputs + style_images, 0, 255)
@@ -115,9 +159,19 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 total_loss.backward(); optimizer.step()
                 running_loss += total_loss.item()
 
-        avg_train_loss = running_loss / len(train_loader)
+            preds = torch.sigmoid(final_logits_clean) > 0.5
+            tp, fp, fn = calculate_metrics(preds, targets, masks)
+            train_tp += tp.item()
+            train_fp += fp.item()
+            train_fn += fn.item()
 
-        # --- Validation Step ---
+        avg_train_loss = running_loss / len(train_loader)
+        train_precision = train_tp / (train_tp + train_fp + 1e-6)
+        train_recall = train_tp / (train_tp + train_fn + 1e-6)
+        train_f1 = 2 * (train_precision * train_recall) / (train_precision + train_recall + 1e-6)
+        train_losses.append(avg_train_loss);
+        train_metrics_history.append({'precision': train_precision, 'recall': train_recall, 'f1': train_f1})
+
         model.eval()
         val_loss, val_tp, val_fp, val_fn = 0.0, 0, 0, 0
         with torch.no_grad():
@@ -134,17 +188,17 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         val_precision = val_tp / (val_tp + val_fp + 1e-6)
         val_recall = val_tp / (val_tp + val_fn + 1e-6)
         val_f1 = 2 * (val_precision * val_recall) / (val_precision + val_recall + 1e-6)
+        val_losses.append(avg_val_loss)
+        val_metrics_history.append({'precision': val_precision, 'recall': val_recall, 'f1': val_f1})
 
         print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val F1: {val_f1:.4f}", file=sys.stderr)
 
-        # --- Check if this is the best model so far ---
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
             best_val_metrics = {'recall': val_recall, 'precision': val_precision, 'f1': val_f1}
             torch.save(model.state_dict(), model_save_path)
             print(f"  -> New best model saved with F1: {val_f1:.4f}", file=sys.stderr)
 
-        # --- NEW: Log detailed metrics for this epoch and save to CSV ---
         epoch_log = {
             'epoch': epoch + 1,
             'train_loss': avg_train_loss,
@@ -155,8 +209,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         }
         epoch_log_history.append(epoch_log)
         pd.DataFrame(epoch_log_history).to_csv(results_csv_path, index=False)
-        # --- END NEW ---
 
+        config.VISUALIZATION_DIR.mkdir(parents=True, exist_ok=True)
+        save_loss_plot(train_losses, val_losses, config.VISUALIZATION_DIR / "loss_curve.png")
+        save_metrics_plot(train_metrics_history, val_metrics_history, config.VISUALIZATION_DIR / "metrics_curve.png")
+        create_inference_visualization(model, train_dataset, device, config.VISUALIZATION_DIR, epoch=epoch + 1, num_samples=10, split_name='train')
+        create_inference_visualization(model, val_dataset, device, config.VISUALIZATION_DIR, epoch=epoch + 1, num_samples=10, split_name='val')
     return best_val_metrics
 
 def main(args):
@@ -166,7 +224,6 @@ def main(args):
     deep_supervision = args.deep_supervision
     inv_loss_weight = args.invariance_loss_weight
     model_save_path = Path(args.model_save_path)
-    # --- NEW: Get the results CSV path ---
     results_csv_path = Path(args.results_csv_path)
 
     set_seed(config.GLOBAL_RANDOM_SEED)
@@ -177,21 +234,32 @@ def main(args):
     geometric_transforms = transforms.Compose([transforms.RandomHorizontalFlip(), transforms.RandomVerticalFlip()])
 
     style_dir = config.PREPROCESSED_DATA_DIR / "style_images"
-    train_dataset = PreprocessedBinaryVegDataset(config.TRAIN_DIR, style_dir=style_dir, use_fda=True, photometric_augs=photometric_transforms, geometric_augs=geometric_transforms)
-    val_dataset = PreprocessedBinaryVegDataset(config.VAL_DIR, style_dir=style_dir, use_fda=False)
+    
+    train_dataset = PreprocessedBinaryVegDataset(
+        config.TRAIN_DIR, 
+        style_dir=style_dir, 
+        is_train=True,
+        use_fda=True, 
+        photometric_augs=photometric_transforms, 
+        geometric_augs=geometric_transforms
+    )
+    val_dataset = PreprocessedBinaryVegDataset(
+        config.VAL_DIR, 
+        style_dir=style_dir, 
+        is_train=False,
+        use_fda=False
+    )
+    # --- END MODIFICATION ---
 
     if len(train_dataset) == 0:
         print("Error: Training dataset is empty. Exiting.", file=sys.stderr); return
-
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
     model = Model(in_channels=train_dataset.num_input_channels, out_channels=1).to(config.DEVICE)
     criterion = MaskedBCELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     if len(train_dataset) > 0 and len(val_dataset) > 0:
-        best_metrics = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, config.DEVICE, deep_supervision, inv_loss_weight, model_save_path, results_csv_path)
+        best_metrics = train_model(model, train_dataset, val_dataset, criterion, optimizer, num_epochs, config.DEVICE, deep_supervision, inv_loss_weight, model_save_path, results_csv_path, batch_size)
 
         final_results = {
             "best_val_recall": best_metrics['recall'],
@@ -199,7 +267,6 @@ def main(args):
             "best_val_f1": best_metrics['f1'],
             "model_path": str(model_save_path)
         }
-        # Print final JSON result to stdout for the search script
         print(json.dumps(final_results))
     else:
         print("Warning: Train or validation loader is empty. Skipping training.", file=sys.stderr)
@@ -212,9 +279,7 @@ if __name__ == "__main__":
     parser.add_argument('--deep-supervision', type=lambda x: (str(x).lower() == 'true'), required=True, help="Enable deep supervision (True/False)")
     parser.add_argument('--invariance-loss-weight', type=float, required=True, help="Weight for the invariance loss")
     parser.add_argument('--model-save-path', type=str, required=True, help="Full path to save the best model checkpoint")
-    # --- NEW ARGUMENT ---
     parser.add_argument('--results-csv-path', type=str, required=True, help="Full path to save the epoch-by-epoch metrics CSV log")
 
     args = parser.parse_args()
     main(args)
-
