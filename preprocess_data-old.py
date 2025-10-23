@@ -164,39 +164,24 @@ def generate_random_negative_annotations(src: rasterio.io.DatasetReader, land_gd
 
 def process_geotiff_and_annotations(tif_path: Path, master_annotations_gdf: geopandas.GeoDataFrame, land_gdf: geopandas.GeoDataFrame, roi_polygon_wgs84: Polygon, output_dir: Path):
     """
-    Processes a GeoTIFF by generating patches from both real annotations
-    and newly generated random negative annotations within a buffered "inland" area.
-    The buffer operation is now robustly handled in a projected CRS.
+    Processes a GeoTIFF, generates patches, and returns a list of all annotations
+    created for this file, linked by their patch basenames.
     """
-    total_patches_generated = 0
-    total_discarded = 0
-    all_patch_annotations_for_file = [] # Make sure to re-add this if it was removed
+    total_patches_generated, total_discarded = 0, 0
+    all_patch_annotations_for_file = []
 
     try:
         with rasterio.open(tif_path) as src:
             image_crs = src.crs
-
-            # --- ROBUST BUFFERING LOGIC ---
-            # Define the standard projected CRS for Sweden (in meters)
-            projected_crs = "EPSG:3006" # SWEREF99 TM
-
-            # 1. Reproject the global land GDF to our standard projected CRS
-            land_gdf_projected = land_gdf.to_crs(projected_crs)
-
-            # 2. Perform the buffer operation accurately in meters
+            land_gdf_local = land_gdf.to_crs(image_crs)
+            
+            inland_gdf_for_sampling = land_gdf_local
             if config.COASTLINE_BUFFER_METERS > 0:
-                print(f"    - Applying a {-config.COASTLINE_BUFFER_METERS}m buffer in {projected_crs}.")
-                inland_geometry_projected = land_gdf_projected.geometry.buffer(-config.COASTLINE_BUFFER_METERS)
-                inland_gdf_projected = geopandas.GeoDataFrame(geometry=inland_geometry_projected, crs=projected_crs)
-                inland_gdf_projected = inland_gdf_projected[~inland_gdf_projected.is_empty]
-            else:
-                inland_gdf_projected = land_gdf_projected
-
-            # 3. Reproject the final (possibly buffered) geometry to the image's local CRS for sampling
-            inland_gdf_for_sampling = inland_gdf_projected.to_crs(image_crs)
-            # --- END ROBUST BUFFERING LOGIC ---
-
-            # --- (The rest of the function proceeds as before) ---
+                print(f"    - Applying a {-config.COASTLINE_BUFFER_METERS}m buffer to create an 'inland' area.")
+                inland_geometry = land_gdf_local.geometry.buffer(-config.COASTLINE_BUFFER_METERS)
+                inland_gdf_for_sampling = geopandas.GeoDataFrame(geometry=inland_geometry, crs=image_crs)
+                inland_gdf_for_sampling = inland_gdf_for_sampling[~inland_gdf_for_sampling.is_empty]
+            
             annotations_in_img_crs = master_annotations_gdf.to_crs(image_crs)
             annotations_in_image = annotations_in_img_crs[annotations_in_img_crs.geometry.intersects(box(*src.bounds))].copy()
             transformer = Transformer.from_crs(config.WGS84_CRS, image_crs, always_xy=True)
@@ -209,10 +194,7 @@ def process_geotiff_and_annotations(tif_path: Path, master_annotations_gdf: geop
             else:
                 annotations_in_roi[veg_cols] = annotations_in_roi[veg_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
 
-            random_points = []
-            if config.NUM_NEGATIVE_ANNOTATIONS_PER_TIF > 0 and not inland_gdf_for_sampling.empty:
-                random_points = generate_random_negative_annotations(src, inland_gdf_for_sampling, config.NUM_NEGATIVE_ANNOTATIONS_PER_TIF)
-
+            random_points = generate_random_negative_annotations(src, inland_gdf_for_sampling, config.NUM_NEGATIVE_LAND_ANNOTATIONS_PER_TIF)
             if random_points:
                 new_rows = {'geometry': random_points}
                 for col in veg_cols: new_rows[col] = 0
@@ -404,7 +386,6 @@ def main():
     else:
         print("\nNo patches were generated, skipping split.")
 
-    source_files = list(all_patches_dir.glob("*_source.h5"))
     if config.TRAIN_DIR.exists() and (config.TRAIN_DIR / f"{Path(source_files[0]).name}").exists():
         extract_style_patches(config.TRAIN_DIR, config.STYLE_IMAGES_DIR, grayscale=args.grayscale_style)
 

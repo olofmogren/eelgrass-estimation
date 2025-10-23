@@ -18,22 +18,19 @@ import fiona.path
 from datetime import datetime # Added for timestamped filenames
 import gc # Added for garbage collection
 import random
-import rasterio.features
-import shapely.geometry
-from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
-
 
 # --- Import your model and helper functions ---
 from unetplusplus import Model
-# from preprocess_data import get_vegetation_columns
+#from preprocess_data import get_vegetation_columns
 import config
 
 # Set matplotlib backend to non-interactive to save memory on servers
 import matplotlib
 matplotlib.use('Agg')
 
+# --- HELPER FUNCTIONS FOR ROI AND BOUNDS ---
 
+# could have been imported from preprocess_data:
 def get_vegetation_columns(df: pd.DataFrame) -> list:
     """Identifies the correct vegetation column names from the dataframe."""
     try:
@@ -50,7 +47,7 @@ def load_all_annotations(all_xlsx_paths: list) -> geopandas.GeoDataFrame:
     all_dfs = []
     # Use a generic WGS84 CRS string that doesn't rely on a config file
     wgs84_crs = "EPSG:4326"
-
+    
     for xlsx_path in tqdm(all_xlsx_paths, desc="Loading all annotations"):
         try:
             df = pd.read_excel(xlsx_path, engine='openpyxl')
@@ -62,23 +59,23 @@ def load_all_annotations(all_xlsx_paths: list) -> geopandas.GeoDataFrame:
                     if 'Latitud' in row.values and 'Longitud' in row.values:
                         df = pd.read_excel(xlsx_path, engine='openpyxl', header=i)
                         found_header = True; break
-                if not found_header:
+                if not found_header: 
                     print(f"  - Skipping {xlsx_path.name} (no Lat/Lon columns found)")
                     continue
-
+            
             df.dropna(subset=['Latitud', 'Longitud'], inplace=True)
             df = df[pd.to_numeric(df['Latitud'], errors='coerce').notna()]
             df = df[pd.to_numeric(df['Longitud'], errors='coerce').notna()]
             if not df.empty: all_dfs.append(df)
         except Exception as e:
             print(f"\nWarning: Could not process file {xlsx_path.name}. Reason: {e}"); continue
-
+    
     if not all_dfs: return geopandas.GeoDataFrame()
-
+    
     master_df = pd.concat(all_dfs, ignore_index=True)
     if 'geometry' in master_df.columns:
         master_df = master_df.drop(columns=['geometry'])
-
+        
     return geopandas.GeoDataFrame(master_df, geometry=geopandas.points_from_xy(master_df.Longitud, master_df.Latitud), crs=wgs84_crs)
 
 
@@ -163,11 +160,7 @@ def collate_fn_skip_corrupt(batch):
     return torch.utils.data.dataloader.default_collate(batch)
 
 def predict_and_visualize(model, device, ortho_path, output_path, master_annotations_gdf, batch_size, land_gdf):
-    """
-    Creates a visualization with the ortho background, overlays positive predictions
-    in the sea as a red diagonal stripe pattern, and marks the coastline.
-    """
-    # --- PHASE 1 (Prediction) remains exactly the same ---
+    # --- PHASE 1 (Prediction) is unchanged ---
     print(f"\n--- Analyzing {ortho_path.name} ---")
     PATCH_WIDTH_PIXELS = 512 # Placeholder
     patch_size = PATCH_WIDTH_PIXELS
@@ -186,7 +179,7 @@ def predict_and_visualize(model, device, ortho_path, output_path, master_annotat
             with torch.inference_mode():
                 for batch in tqdm(dataloader, desc=f"Predicting on {ortho_path.name}"):
                     if not batch: continue
-                    images = batch['image'].to(device).float()
+                    images = batch['image'].to(device)
                     x_coords, y_coords = batch['x'], batch['y']
                     _, _, _, logits, _ = model(images)
                     preds = (torch.sigmoid(logits) > 0.5).cpu().numpy().astype(np.uint8)
@@ -199,7 +192,7 @@ def predict_and_visualize(model, device, ortho_path, output_path, master_annotat
                         data_to_write = pred_patch[:, :write_h, :write_w]
                         dst.write(data_to_write, window=write_window)
 
-    # --- PHASE 2: VISUALIZATION (New Logic) ---
+    # --- PHASE 2: VISUALIZATION ---
     print("Creating visualization...")
     
     # Load and filter annotations from the master DataFrame
@@ -207,16 +200,16 @@ def predict_and_visualize(model, device, ortho_path, output_path, master_annotat
     if not master_annotations_gdf.empty:
         # Reproject all annotations to the ortho's CRS
         gdf = master_annotations_gdf.to_crs(ortho_crs)
-
+        
         # Spatially filter for points within the current ortho's bounds
         ortho_poly = shapely.geometry.box(*ortho_bounds)
         gdf_filtered = gdf[gdf.geometry.intersects(ortho_poly)].copy() # Use .copy() to avoid SettingWithCopyWarning
-
+        
         if not gdf_filtered.empty:
             print(f"  -> Found {len(gdf_filtered)} annotations for this ortho.")
             # Use the robust function to find vegetation columns
             veg_cols = get_vegetation_columns(gdf_filtered)
-
+            
             if veg_cols:
                 gdf_filtered[veg_cols] = gdf_filtered[veg_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
                 total_veg = gdf_filtered[veg_cols].sum(axis=1)
@@ -227,78 +220,73 @@ def predict_and_visualize(model, device, ortho_path, output_path, master_annotat
                     else:
                         non_veg_points.append(point)
 
-
     fig, ax = plt.subplots(figsize=(20, 20))
     
     # 1. Draw the original Orthomosaic as the background (zorder=1)
+    # We must downsample it to prevent memory crashes, just like the prediction raster.
     with rasterio.open(ortho_path) as ortho_src:
         max_dim = max(ortho_src.width, ortho_src.height)
         decimation = max(1, max_dim // 4000)
         out_shape = (int(ortho_src.height // decimation), int(ortho_src.width // decimation))
+        
+        # Read the first 3 bands (RGB)
         ortho_img = ortho_src.read((1, 2, 3), out_shape=out_shape, resampling=rasterio.enums.Resampling.bilinear)
+        
+        # Transpose the array from (channels, height, width) to (height, width, channels) for imshow
         ortho_img_plot = np.transpose(ortho_img, (1, 2, 0))
+        
+        # Any pixel where all 3 bands are 0 is considered NoData.
+        # valid_data_mask = (ortho_img.sum(axis=0) > 0).astype(np.uint8)
+        valid_data_mask = ortho_src.read_masks(1, out_shape=out_shape, resampling=rasterio.enums.Resampling.bilinear)
+        
         ax.imshow(ortho_img_plot, extent=rasterio.plot.plotting_extent(ortho_src), zorder=1)
 
-    # 2. Prepare Prediction Data and Land Mask
+    # 2. Draw the Prediction Layer on top (zorder=2)
     with rasterio.open(prediction_geotiff_path) as pred_src:
-        # Get the transform for the downsampled grid
-        downsampled_transform = pred_src.transform * pred_src.transform.scale(
-            (pred_src.width / out_shape[1]),
-            (pred_src.height / out_shape[0])
-        )
-        
-        # Read downsampled prediction data
+        # Use the same downsampling shape as the ortho for perfect alignment
         averaged_data = pred_src.read(1, out_shape=out_shape, resampling=rasterio.enums.Resampling.average)
         pred_data = (averaged_data > 0).astype(np.uint8)
-
-        # Create a land mask by rasterizing the land polygons onto the same grid
-        land_gdf_local = land_gdf.to_crs(ortho_crs)
-        land_mask = rasterio.features.rasterize(
-            land_gdf_local.geometry,
-            out_shape=out_shape,
-            transform=downsampled_transform,
-            fill=0,
-            default_value=1,
-            dtype=np.uint8
-        )
         
-        # --- Apply the mask: Set predictions on land to 0 (transparent) ---
-        pred_data[land_mask == 1] = 0
+        # The colormap for '0' is transparent, for '1' it's semi-transparent red
+        cmap_pred = ListedColormap([(0, 0, 0, 0), (1, 0.5, 0.5, 0.6)])
+        
+        ax.imshow(pred_data, cmap=cmap_pred, extent=rasterio.plot.plotting_extent(pred_src), zorder=2, vmin=0, vmax=1)
+        
+        # --- NEW: Apply both masks ---
+        pred_data[land_mask == 1] = 0        # Erase predictions on land
+        pred_data[valid_data_mask == 0] = 0  # Erase predictions in NoData areas
 
-        # 3. Convert masked predictions to vector polygons and plot with a pattern
-        # This finds contiguous areas of pixels with value 1
+
+        # 3. Convert final masked predictions to polygons and plot
         shapes = rasterio.features.shapes(pred_data, transform=downsampled_transform)
-        
-        # Create a list of shapely Polygons
         prediction_polygons = [shapely.geometry.shape(geom) for geom, val in shapes if val == 1]
 
         if prediction_polygons:
-            # Create a GeoDataFrame from the polygons
             gdf_preds = geopandas.GeoDataFrame(geometry=prediction_polygons, crs=ortho_crs)
+            gdf_preds.plot(ax=ax, facecolor='none', hatch='///', edgecolor='red', linewidth=0.5, zorder=2)
             
-            # Plot the polygons with a red diagonal hatch pattern
-            gdf_preds.plot(ax=ax, facecolor='none', hatch='///', edgecolor='red', linewidth=0, zorder=2)
-            
+    # 4. Draw the Land/Sea Border on top of the imagery (zorder=3)
+    land_gdf_local = land_gdf.to_crs(ortho_crs)
+    # Set 'facecolor' to 'none' to only draw the outline
+    land_gdf_local.plot(ax=ax, facecolor='none', edgecolor='yellow', linewidth=1.5, zorder=3)
+
+
+
     if non_veg_points:
         x, y = zip(*non_veg_points)
         ax.scatter(x, y, c='white', s=50, edgecolors='black', label='Annotation (Non-Veg)', zorder=4)
     if veg_points:
         x, y = zip(*veg_points)
         ax.scatter(x, y, c='darkred', s=50, edgecolors='black', label='Annotation (Veg)', zorder=4)
+        
+    print('veg points', len(veg_points), ', non veg points', len(non_veg_points))
 
-    # 4. Draw the Land/Sea Border on top of everything (zorder=3)
-    land_gdf_local.plot(ax=ax, facecolor='none', edgecolor='yellow', linewidth=1.5, zorder=3)
-    
-    # Set plot limits
     minx, miny, maxx, maxy = ortho_bounds
-    ax.set_xlim(minx, maxx); ax.set_ylim(miny, maxy)
+    ax.set_xlim(minx, maxx)
+    ax.set_ylim(miny, maxy)
 
-    # --- NEW LEGEND for patterns ---
-    legend_elements = [
-        Patch(facecolor='none', edgecolor='red', hatch='///', label='Predicted Vegetation'),
-        Line2D([0], [0], color='yellow', lw=2, label='Coastline')
-    ]
-    ax.legend(handles=legend_elements, loc='upper right', fontsize=12)
+    # (Legend code same as before...)
+    ax.legend(loc='upper right', fontsize=12)
     ax.set_title(f"Model Predictions on {ortho_path.name}", fontsize=16)
     ax.set_xlabel("Easting"); ax.set_ylabel("Northing")
     ax.tick_params(axis='x', rotation=45)
@@ -308,7 +296,7 @@ def predict_and_visualize(model, device, ortho_path, output_path, master_annotat
     plt.close(fig)
 
     print(f"Prediction GeoTIFF saved to {prediction_geotiff_path}")
-    print(f"Visualization saved to {output_path}") 
+    print(f"Visualization saved to {output_path}")    
     
 def main():
     parser = argparse.ArgumentParser(description="Run inference on all orthomosaics in a directory and generate visualizations.")

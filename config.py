@@ -51,4 +51,7 @@ STYLE_IMAGE_AUGMENTATION_PROBABILITY = 0.1
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 GLOBAL_RANDOM_SEED = 42
 DEEP_SUPERVISION=True
+LAND_SHP_PATH="shapefiles/Europe_coastline.shp"
+COASTLINE_BUFFER_METERS=6
+NUM_NEGATIVE_LAND_ANNOTATIONS_PER_TIF=15
 
