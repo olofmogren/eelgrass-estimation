@@ -210,8 +210,8 @@ def process_geotiff_and_annotations(tif_path: Path, master_annotations_gdf: geop
                 annotations_in_roi[veg_cols] = annotations_in_roi[veg_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
 
             random_points = []
-            if config.NUM_NEGATIVE_ANNOTATIONS_PER_TIF > 0 and not inland_gdf_for_sampling.empty:
-                random_points = generate_random_negative_annotations(src, inland_gdf_for_sampling, config.NUM_NEGATIVE_ANNOTATIONS_PER_TIF)
+            if config.NUM_NEGATIVE_LAND_ANNOTATIONS_PER_TIF > 0 and not inland_gdf_for_sampling.empty:
+                random_points = generate_random_negative_annotations(src, inland_gdf_for_sampling, config.NUM_NEGATIVE_LAND_ANNOTATIONS_PER_TIF)
 
             if random_points:
                 new_rows = {'geometry': random_points}
