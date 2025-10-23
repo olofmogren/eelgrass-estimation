@@ -404,9 +404,11 @@ def main():
     else:
         print("\nNo patches were generated, skipping split.")
 
-    source_files = list(all_patches_dir.glob("*_source.h5"))
-    if config.TRAIN_DIR.exists() and (config.TRAIN_DIR / f"{Path(source_files[0]).name}").exists():
+    if config.TRAIN_DIR.exists() and any(config.TRAIN_DIR.glob("*_source.h5")):
+        print("\n--- Found training patches. Generating style images... ---")
         extract_style_patches(config.TRAIN_DIR, config.STYLE_IMAGES_DIR, grayscale=args.grayscale_style)
+    else:
+        print("\n--- No training patches found. Skipping style image generation. ---")
 
     print("\n--- Preprocessing Complete ---")
 
