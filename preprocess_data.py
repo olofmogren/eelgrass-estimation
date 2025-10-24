@@ -6,6 +6,7 @@ import argparse
 import h5py
 import json  # Added for JSON output
 import math
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import geopandas
@@ -362,6 +363,15 @@ def main():
         }
     }
 
+    output_dir.mkdir(parents=True, exist_ok=True)
+    settings_file_path = output_dir / "dataset_settings.json"
+    try:
+        with open(settings_file_path, 'w') as f:
+            json.dump(preprocessing_settings, f, indent=4)
+        print(f"\n--- Saved preprocessing settings to {settings_file_path} ---")
+    except Exception as e:
+        print(f"\n--- WARNING: Could not save preprocessing settings. Reason: {e} ---")
+
     try:
         land_shp_path = data_dir / config.LAND_SHP_PATH
         if not land_shp_path.exists():
@@ -400,7 +410,7 @@ def main():
 
     all_patches_dir = output_dir / "all_patches"
     if all_patches_dir.exists(): shutil.rmtree(all_patches_dir)
-    all_patches_dir.mkdir(parents=True)
+    all_patches_dir.mkdir(parents=True, exist_ok=True)
     if config.TRAIN_DIR.exists(): shutil.rmtree(config.TRAIN_DIR)
     if config.VAL_DIR.exists(): shutil.rmtree(config.VAL_DIR)
     if config.TEST_DIR.exists(): shutil.rmtree(config.TEST_DIR)
@@ -430,13 +440,6 @@ def main():
     else:
         print("\n--- No training patches found. Skipping style image generation. ---")
 
-    settings_file_path = output_dir / "dataset_settings.json"
-    try:
-        with open(settings_file_path, 'w') as f:
-            json.dump(preprocessing_settings, f, indent=4)
-        print(f"\n--- Saved preprocessing settings to {settings_file_path} ---")
-    except Exception as e:
-        print(f"\n--- WARNING: Could not save preprocessing settings. Reason: {e} ---")
 
     print("\n--- Preprocessing Complete ---")
 

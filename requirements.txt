@@ -1,17 +1,15 @@
 pathlib
-torch
-h5py
-numpy
-pandas
-geopandas
-shapely
-rasterio
-pyproj
-tqdm
 typing
 torch
 torchvision
-matplotlib
-openpyxl
+geopandas
+pandas
+shapely
+pyproj
+rasterio
 scipy
+torchgeo
+h5py
+openpyxl
+fiona==1.9.6
 

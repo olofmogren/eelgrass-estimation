@@ -162,6 +162,24 @@ def collate_fn_skip_corrupt(batch):
         return {} # Return an empty dict that the loop can check for
     return torch.utils.data.dataloader.default_collate(batch)
 
+def load_split_annotations(preprocessed_dir: Path) -> dict:
+    """Loads annotations from train/val/test JSON files into a dictionary."""
+    annotations = {'train': [], 'val': [], 'test': []}
+    for split in annotations.keys():
+        json_path = preprocessed_dir / split / "annotations.json"
+        if json_path.exists():
+            print(f"  -> Loading annotations from {json_path}")
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+                # Flatten the data into a simple list of points with labels
+                for patch_info in data:
+                    for ann in patch_info['annotations']:
+                        annotations[split].append({
+                            'geometry': Point(ann['x'], ann['y']),
+                            'label': ann['label']
+                        })
+    return annotations
+
 def predict_and_visualize(model, device, ortho_path, output_path, master_annotations_gdf, batch_size, land_gdf):
     """
     Creates a visualization with the ortho background, overlays positive predictions
@@ -201,32 +219,17 @@ def predict_and_visualize(model, device, ortho_path, output_path, master_annotat
 
     # --- PHASE 2: VISUALIZATION (New Logic) ---
     print("Creating visualization...")
+
+    ortho_poly = shapely.geometry.box(*ortho_bounds)
+    split_points = {'train': [], 'val': [], 'test': []}
     
-    # Load and filter annotations from the master DataFrame
-    veg_points, non_veg_points = [], []
-    if not master_annotations_gdf.empty:
-        # Reproject all annotations to the ortho's CRS
-        gdf = master_annotations_gdf.to_crs(ortho_crs)
-
-        # Spatially filter for points within the current ortho's bounds
-        ortho_poly = shapely.geometry.box(*ortho_bounds)
-        gdf_filtered = gdf[gdf.geometry.intersects(ortho_poly)].copy() # Use .copy() to avoid SettingWithCopyWarning
-
+    for split, points in all_annotations.items():
+        if not points: continue
+        # Create a GeoDataFrame for efficient filtering
+        gdf = geopandas.GeoDataFrame(points, crs="EPSG:3006").to_crs(ortho_crs) # Assuming original CRS is SWEREF99 TM
+        gdf_filtered = gdf[gdf.geometry.intersects(ortho_poly)]
         if not gdf_filtered.empty:
-            print(f"  -> Found {len(gdf_filtered)} annotations for this ortho.")
-            # Use the robust function to find vegetation columns
-            veg_cols = get_vegetation_columns(gdf_filtered)
-
-            if veg_cols:
-                gdf_filtered[veg_cols] = gdf_filtered[veg_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
-                total_veg = gdf_filtered[veg_cols].sum(axis=1)
-                for idx, row in gdf_filtered.iterrows():
-                    point = (row.geometry.x, row.geometry.y)
-                    if total_veg.loc[idx] >= 40:
-                        veg_points.append(point)
-                    else:
-                        non_veg_points.append(point)
-
+            split_points[split] = [(row.geometry.x, row.geometry.y, row.label) for _, row in gdf_filtered.iterrows()]
 
     fig, ax = plt.subplots(figsize=(20, 20))
     
@@ -279,24 +282,41 @@ def predict_and_visualize(model, device, ortho_path, output_path, master_annotat
             # Plot the polygons with a red diagonal hatch pattern
             gdf_preds.plot(ax=ax, facecolor='none', hatch='///', edgecolor='red', linewidth=0, zorder=2)
             
-    if non_veg_points:
-        x, y = zip(*non_veg_points)
-        ax.scatter(x, y, c='white', s=50, edgecolors='black', label='Annotation (Non-Veg)', zorder=4)
-    if veg_points:
-        x, y = zip(*veg_points)
-        ax.scatter(x, y, c='darkred', s=50, edgecolors='black', label='Annotation (Veg)', zorder=4)
-
     # 4. Draw the Land/Sea Border on top of everything (zorder=3)
     land_gdf_local.plot(ax=ax, facecolor='none', edgecolor='yellow', linewidth=1.5, zorder=3)
     
+    # 5. Draw Differentiated Annotations ---
+    # Draw TEST points (opaque)
+    if split_points['test']:
+        veg = [(x, y) for x, y, label in split_points['test'] if label == 1]
+        non_veg = [(x, y) for x, y, label in split_points['test'] if label == 0]
+        if non_veg: ax.scatter(*zip(*non_veg), c='white', s=60, edgecolors='black', zorder=5, marker='s')
+        if veg: ax.scatter(*zip(*veg), c='darkred', s=60, edgecolors='black', zorder=5, marker='s')
+
+    # Draw VAL points (opaque)
+    if split_points['val']:
+        veg = [(x, y) for x, y, label in split_points['val'] if label == 1]
+        non_veg = [(x, y) for x, y, label in split_points['val'] if label == 0]
+        if non_veg: ax.scatter(*zip(*non_veg), c='white', s=50, edgecolors='black', zorder=4, marker='^')
+        if veg: ax.scatter(*zip(*veg), c='darkred', s=50, edgecolors='black', zorder=4, marker='^')
+
+    # Draw TRAIN points (semi-transparent)
+    if split_points['train']:
+        veg = [(x, y) for x, y, label in split_points['train'] if label == 1]
+        non_veg = [(x, y) for x, y, label in split_points['train'] if label == 0]
+        if non_veg: ax.scatter(*zip(*non_veg), c='white', s=40, edgecolors='black', zorder=4, alpha=0.5)
+        if veg: ax.scatter(*zip(*veg), c='darkred', s=40, edgecolors='black', zorder=4, alpha=0.5)
+
     # Set plot limits
     minx, miny, maxx, maxy = ortho_bounds
     ax.set_xlim(minx, maxx); ax.set_ylim(miny, maxy)
 
-    # --- NEW LEGEND for patterns ---
     legend_elements = [
         Patch(facecolor='none', edgecolor='red', hatch='///', label='Predicted Vegetation'),
-        Line2D([0], [0], color='yellow', lw=2, label='Coastline')
+        Line2D([0], [0], color='yellow', lw=2, label='Coastline'),
+        Line2D([0], [0], marker='s', ls='none', c='w', mec='k', mew=1, markersize=10, label='Test Point'),
+        Line2D([0], [0], marker='^', ls='none', c='w', mec='k', mew=1, markersize=10, label='Validation Point'),
+        Line2D([0], [0], marker='o', ls='none', c='w', mec='k', mew=1, markersize=10, alpha=0.5, label='Training Point')
     ]
     ax.legend(handles=legend_elements, loc='upper right', fontsize=12)
     ax.set_title(f"Model Predictions on {ortho_path.name}", fontsize=16)
@@ -329,15 +349,16 @@ def main():
     model.load_state_dict(torch.load(args.model_path, map_location=device))
     model.eval()
 
-    print("\nSearching for annotation files...")
-    all_xlsx_paths = list(args.ortho_dir.glob("**/*.xlsx"))
-    if not all_xlsx_paths:
-        print("  -> No .xlsx annotation files found. Continuing without annotations.")
-        master_annotations_gdf = geopandas.GeoDataFrame()
-    else:
-        print(f"  -> Found {len(all_xlsx_paths)} annotation files. Loading...")
-        master_annotations_gdf = load_all_annotations(all_xlsx_paths)
-        print(f"  -> Successfully loaded a total of {len(master_annotations_gdf)} annotations.")
+    
+    # --- NEW: Create a timestamped subdirectory for this run's outputs ---
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_output_dir = args.output_dir / timestamp
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nOutputs for this run will be saved in: {run_output_dir}")
+
+    # --- NEW: Load all annotations from the preprocessed data directory ---
+    print("\nLoading annotations from preprocessed data splits...")
+    all_annotations = load_split_annotations(config.PREPROCESSED_DATA_DIR)
 
     try:
         roi_poly = load_roi_polygon_wgs84(args.roi_path)
@@ -374,17 +395,17 @@ def main():
     for i, ortho_path in enumerate(tiffs_to_process):
         print(f"\n--- Processing file {i+1} of {num_to_process}: {ortho_path.name} ---")
 
-        timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
-        output_path = args.output_dir / f"{timestamp}_prediction.png"
+        output_filename_base = ortho_path.stem
+        output_path = run_output_dir / f"{output_filename_base}.png"
 
         predict_and_visualize(
             model=model,
             device=device,
             ortho_path=ortho_path,
             output_path=output_path,
-            master_annotations_gdf=master_annotations_gdf, # Pass the pre-loaded DataFrame
+            all_annotations=all_annotations, # Pass the dictionary of all annotations
             batch_size=args.batch_size,
-            land_gdf=land_gdf  # Pass the pre-loaded GeoDataFrame
+            land_gdf=land_gdf
         )
 
         gc.collect()
