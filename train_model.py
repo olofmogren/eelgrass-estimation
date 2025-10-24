@@ -223,10 +223,25 @@ def main(args):
     num_epochs = args.num_epochs
     deep_supervision = args.deep_supervision
     inv_loss_weight = args.invariance_loss_weight
-    model_save_path = Path(args.model_save_path)
-    results_csv_path = Path(args.results_csv_path)
+
+    model_name = Model.__module__
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    model_filename = (
+        f"{model_name}"
+        f"_lr-{lr}"
+        f"_bs-{batch_size}"
+        f"_ds-{deep_supervision}"
+        f"_inv-{inv_loss_weight}"
+        f"_{timestamp}.pth"
+    )
+
+    output_dir = Path(args.output_dir)
+    model_save_path = output_dir / model_filename
+    results_csv_path = output_dir / model_filename.replace(".pth", "_metrics.csv")
 
     set_seed(config.GLOBAL_RANDOM_SEED)
+    output_dir.mkdir(parents=True, exist_ok=True) # Ensure the main output directory exists
     model_save_path.parent.mkdir(parents=True, exist_ok=True)
     results_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -249,7 +264,6 @@ def main(args):
         is_train=False,
         use_fda=False
     )
-    # --- END MODIFICATION ---
 
     if len(train_dataset) == 0:
         print("Error: Training dataset is empty. Exiting.", file=sys.stderr); return
@@ -278,8 +292,7 @@ if __name__ == "__main__":
     parser.add_argument('--num-epochs', type=int, default=config.NUM_EPOCHS, help="Number of training epochs")
     parser.add_argument('--deep-supervision', type=lambda x: (str(x).lower() == 'true'), required=True, help="Enable deep supervision (True/False)")
     parser.add_argument('--invariance-loss-weight', type=float, required=True, help="Weight for the invariance loss")
-    parser.add_argument('--model-save-path', type=str, required=True, help="Full path to save the best model checkpoint")
-    parser.add_argument('--results-csv-path', type=str, required=True, help="Full path to save the epoch-by-epoch metrics CSV log")
+    parser.add_argument('--output-dir', type=str, required=True, help="Directory to save the model checkpoint and metrics CSV.")
 
     args = parser.parse_args()
     main(args)

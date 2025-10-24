@@ -41,24 +41,17 @@ def main():
 
     for i, params in enumerate(hparam_configs):
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        params_str = "_".join([f"{key.replace('_','')[0:2]}-{value}" for key, value in params.items()])
+        trial_dir_name = f"trial_{i+1}_{run_id}_{params_str}"
+        trial_output_dir = search_results_dir / trial_dir_name
+
         print(f"\n--- Starting Trial {i+1}/{total_trials} (Run ID: {run_id}) ---")
         print(f"Parameters: {params}")
-
-        # --- NEW: Create descriptive filenames for model and detailed log ---
-        # Create a compact string from the current hyperparameter combination for the filename
-        params_str = "_".join([f"{key.replace('_','')[0:2]}{value}" for key, value in params.items()])
-
-        model_filename = f"model_{run_id}_{params_str}.pth"
-        log_filename = f"log_{run_id}_{params_str}.csv"
-
-        model_save_path = search_results_dir / model_filename
-        results_csv_path = search_results_dir / log_filename # Path for the detailed log
-        # --- END NEW ---
+        print(f"Outputting to directory: {trial_output_dir}")
 
         command = [
             'python', 'train_model.py',
-            '--model-save-path', str(model_save_path),
-            '--results-csv-path', str(results_csv_path) # Pass the new log path
+            '--output-dir', str(trial_output_dir) # Pass the newly created directory path
         ]
         for key, value in params.items():
             command.extend([f'--{key}', str(value)])
