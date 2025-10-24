@@ -342,6 +342,26 @@ def main():
     data_dir, output_dir = Path(args.data_dir), Path(args.output_dir)
     print("--- Starting Preprocessing ---")
 
+    preprocessing_settings = {
+        'timestamp': datetime.now().isoformat(),
+        'cli_args': {
+            'data_dir': str(args.data_dir),
+            'output_dir': str(args.output_dir),
+            'years': args.years,
+            'grayscale_style': args.grayscale_style
+        },
+        'config_settings': {
+            'PATCH_HEIGHT_PIXELS': getattr(config, 'PATCH_HEIGHT_PIXELS', None),
+            'PATCH_WIDTH_PIXELS': getattr(config, 'PATCH_WIDTH_PIXELS', None),
+            'NUM_PATCHES_PER_ANNOTATION': getattr(config, 'NUM_PATCHES_PER_ANNOTATION', None),
+            'NUM_NEGATIVE_LAND_ANNOTATIONS_PER_TIF': getattr(config, 'NUM_NEGATIVE_LAND_ANNOTATIONS_PER_TIF', None),
+            'COASTLINE_BUFFER_METERS': getattr(config, 'COASTLINE_BUFFER_METERS', None),
+            'LAND_SHP_PATH': getattr(config, 'LAND_SHP_PATH', None),
+            'ROI_FILE_NAME': getattr(config, 'ROI_FILE_NAME', None),
+            'GLOBAL_RANDOM_SEED': getattr(config, 'GLOBAL_RANDOM_SEED', None)
+        }
+    }
+
     try:
         land_shp_path = data_dir / config.LAND_SHP_PATH
         if not land_shp_path.exists():
@@ -409,6 +429,14 @@ def main():
         extract_style_patches(config.TRAIN_DIR, config.STYLE_IMAGES_DIR, grayscale=args.grayscale_style)
     else:
         print("\n--- No training patches found. Skipping style image generation. ---")
+
+    settings_file_path = output_dir / "dataset_settings.json"
+    try:
+        with open(settings_file_path, 'w') as f:
+            json.dump(preprocessing_settings, f, indent=4)
+        print(f"\n--- Saved preprocessing settings to {settings_file_path} ---")
+    except Exception as e:
+        print(f"\n--- WARNING: Could not save preprocessing settings. Reason: {e} ---")
 
     print("\n--- Preprocessing Complete ---")
 

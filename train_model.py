@@ -245,6 +245,15 @@ def main(args):
     model_save_path.parent.mkdir(parents=True, exist_ok=True)
     results_csv_path.parent.mkdir(parents=True, exist_ok=True)
 
+    dataset_settings = {} # Default to an empty dict
+    settings_path = config.PREPROCESSED_DATA_DIR / "dataset_settings.json"
+    if settings_path.exists():
+        print(f"Loading dataset settings from {settings_path}")
+        with open(settings_path, 'r') as f:
+            dataset_settings = json.load(f)
+    else:
+        print(f"Warning: dataset_settings.json not found at {settings_path}")
+
     photometric_transforms = transforms.Compose([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))])
     geometric_transforms = transforms.Compose([transforms.RandomHorizontalFlip(), transforms.RandomVerticalFlip()])
 
@@ -279,8 +288,13 @@ def main(args):
             "best_val_recall": best_metrics['recall'],
             "best_val_precision": best_metrics['precision'],
             "best_val_f1": best_metrics['f1'],
-            "model_path": str(model_save_path)
+            "model_path": str(model_save_path),
+            "preprocessing_settings": dataset_settings
         }
+        final_results_path = output_dir / model_filename.replace(".pth", "_final_results.json")
+        with open(final_results_path, 'w') as f:
+            json.dump(final_results, f, indent=4)
+
         print(json.dumps(final_results))
     else:
         print("Warning: Train or validation loader is empty. Skipping training.", file=sys.stderr)
