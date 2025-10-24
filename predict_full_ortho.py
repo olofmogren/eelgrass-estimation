@@ -332,11 +332,11 @@ def predict_and_visualize(model, device, ortho_path, output_path, master_annotat
     
 def main():
     parser = argparse.ArgumentParser(description="Run inference on all orthomosaics in a directory and generate visualizations.")
-    parser.add_argument('--ortho-dir', type=Path, required=True, help="Path to the directory containing orthomosaic GeoTIFF files.")
+    parser.add_argument('--ortho-dir', type=Path, default='data', help="Path to the directory containing orthomosaic GeoTIFF files.")
     parser.add_argument('--model-path', type=Path, required=True, help="Path to the trained model checkpoint (.pth file).")
-    parser.add_argument('--land-shp-path', type=Path, required=True, help="Path to the land polygon shapefile.")
-    parser.add_argument('--roi-path', type=Path, required=True, help="Path to the roi.txt file.")
-    parser.add_argument('--output-dir', type=Path, required=True, help="Path to the directory to save the output files.")
+    parser.add_argument('--land-shp-path', type=Path, default='data/shapefiles/Europe_coastline.shp', help="Path to the land polygon shapefile.")
+    parser.add_argument('--roi-path', type=Path, default='data/roi.txt', help="Path to the roi.txt file.")
+    parser.add_argument('--output-dir', type=Path, default='full-predictions', help="Path to the directory to save the output files.")
     parser.add_argument('--batch-size', type=int, default=12, help="Batch size for inference.")
     args = parser.parse_args()
 
