@@ -287,12 +287,12 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train model with specific hyperparameters.")
-    parser.add_argument('--learning-rate', type=float, required=True, help="Learning rate")
-    parser.add_argument('--batch-size', type=int, required=True, help="Batch size")
-    parser.add_argument('--num-epochs', type=int, default=config.NUM_EPOCHS, help="Number of training epochs")
-    parser.add_argument('--deep-supervision', type=lambda x: (str(x).lower() == 'true'), required=True, help="Enable deep supervision (True/False)")
-    parser.add_argument('--invariance-loss-weight', type=float, required=True, help="Weight for the invariance loss")
-    parser.add_argument('--output-dir', type=str, required=True, help="Directory to save the model checkpoint and metrics CSV.")
+    parser.add_argument('--learning-rate', type=float, default=config.DEFAULT_LEARNING_RATE, help="Learning rate")
+    parser.add_argument('--batch-size', type=int, default=config.DEFAULT_BATCH_SIZE, help="Batch size")
+    parser.add_argument('--num-epochs', type=int, default=config.DEFAULT_NUM_EPOCHS, help="Number of training epochs")
+    parser.add_argument('--deep-supervision', type=lambda x: (str(x).lower() == 'true'), default=config.DEFAULT_DEEP_SUPERVISION, help="Enable deep supervision (True/False)")
+    parser.add_argument('--invariance-loss-weight', type=float, default=config.DEFAULT_INVARIANCE_LOSS_WEIGHT, help="Weight for the invariance loss")
+    parser.add_argument('--output-dir', type=str, default=config.DEFAULT_OUTPUT_DIR, help="Directory to save the model checkpoint and metrics CSV.")
 
     args = parser.parse_args()
     main(args)
